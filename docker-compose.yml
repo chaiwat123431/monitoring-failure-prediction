@@ -1,3 +1,7 @@
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@timescaledb:5432/${POSTGRES_DB:-monitoring}
+  KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+
 services:
   redpanda:
     image: redpandadata/redpanda:v22.2.4
@@ -42,8 +46,7 @@ services:
       context: ./backend
       target: dev
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@timescaledb:5432/${POSTGRES_DB:-monitoring}
-      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      <<: *backend-env
     ports:
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     volumes:
@@ -59,6 +62,52 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  migrate:
+    build:
+      context: ./backend
+      target: dev
+    command: ["python", "-m", "app.ingestion.migrate"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: "no"
+
+  producer:
+    build:
+      context: ./backend
+      target: dev
+    command: ["python", "-m", "app.ingestion.producer"]
+    environment:
+      <<: *backend-env
+      NAB_DATA_DIR: /data
+      REPLAY_SPEED: ${REPLAY_SPEED:-0}
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  consumer:
+    build:
+      context: ./backend
+      target: dev
+    command: ["python", "-m", "app.ingestion.consumer"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   frontend:
     build:
