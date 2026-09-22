@@ -214,6 +214,160 @@ connect works, then the client hangs". So:
 chunk interval; Kafka topic/partition/key design; DB migration tool (Alembic vs plain SQL init
 scripts); final DB/Kafka client libraries; consumer topology (above).
 
+### Slice 2 — Ingestion (status: PROPOSED, awaiting validation — no code written yet)
+
+Scope guard: this slice covers exactly NAB replay → Kafka → TimescaleDB. No feature engineering, no
+model, no inference API — those are Slices 3 and 4. Verified against the real NAB corpus (fetched
+from `github.com/numenta/NAB`, not guessed from memory) before writing this section.
+
+#### AD-10. Dataset: two `realAWSCloudwatch` CPU-utilization series, not the full corpus
+
+- **Primary — `realAWSCloudwatch/ec2_cpu_utilization_825cc2.csv`.** 4,032 rows, `timestamp,value`,
+  5-minute cadence (a few 10-minute gaps — real data, not synthetic-uniform), spanning
+  2014-04-10 → 2014-04-24. CPU utilization is the single most canonical "server health" metric, and
+  this file has **exactly one** labeled anomaly window
+  (`2014-04-15 07:24:00` → `2014-04-16 11:54:00`, per NAB's `combined_windows.json`) — a single,
+  isolated window is deliberately the easiest case to hand-verify end to end (the whole point of
+  this slice, per the scope guard below).
+- **Secondary — `realAWSCloudwatch/rds_cpu_utilization_cc0c53.csv`.** Same shape (4,032 rows, same
+  5-minute-ish cadence, `timestamp,value`), same metric family (CPU%) but a different resource type
+  (RDS vs EC2) and **two** non-overlapping anomaly windows. This forces the label-matching logic to
+  handle more than one window per series before the slice is called done, without adding a second
+  code path — the file format is identical to the primary series.
+- **Rejected**: (a) *the full NAB corpus* (58 real + 4 artificial files) — the scope guard is
+  "replay NAB → Kafka → TimescaleDB", not "ingest all of NAB"; once the pipeline is proven correct
+  against 2 known-good files (this slice's actual risk, per the user's own framing below), adding
+  more files is a one-line config change, not new code. (b) *`realKnownCause`* — checked concretely:
+  `machine_temperature_system_failure.csv` is 22,695 rows over ~79 days (vs. 4,032 rows / 14 days
+  for `realAWSCloudwatch`), and `nyc_taxi.csv` is 30-minute cadence and measures taxi passenger
+  counts, not a server/IoT metric. The category is narratively appealing (documented root causes)
+  but mixes cadences and domains — that's variable-cadence-handling scope this slice doesn't need
+  yet. (c) *`artificialWithAnomaly`/`artificialNoAnomaly`* — synthetic sine/step signals, don't
+  resemble real infrastructure telemetry. (d) *`realTraffic`/`realTweets`/`realAdExchange`* —
+  off-topic domains (road sensors, tweet mentions, ad clicks), not server/IoT.
+
+#### AD-11. TimescaleDB schema: anomaly labels live in a separate table, never a column on the raw hypertable
+
+```sql
+CREATE TABLE raw_metrics (
+    time      TIMESTAMPTZ      NOT NULL,  -- the row's own NAB timestamp (UTC), never replay wall-clock time
+    series_id TEXT             NOT NULL,  -- e.g. 'realAWSCloudwatch/ec2_cpu_utilization_825cc2'
+    value     DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (series_id, time)
+);
+SELECT create_hypertable('raw_metrics', by_range('time', INTERVAL '1 day'));
+
+CREATE TABLE nab_anomaly_windows (
+    id           SERIAL PRIMARY KEY,
+    series_id    TEXT        NOT NULL,
+    window_start TIMESTAMPTZ NOT NULL,
+    window_end   TIMESTAMPTZ NOT NULL,
+    UNIQUE (series_id, window_start, window_end)
+);
+```
+
+- **Partitioning key: `time`**, chunk interval **1 day** — the dataset is tiny (14 days × 2 series),
+  so performance doesn't force this, but daily chunks match TimescaleDB's own sizing guidance for
+  data at this density and are a sane default now that the tag/chunk decision AD-4 explicitly
+  deferred needs to be made. Space-partitioning by `series_id` is deferred — not worth it at 2
+  series.
+- **Why the label is a separate table, not `raw_metrics.is_anomaly`** (this is the item most worth
+  your validation): NAB's ground truth is fundamentally a set of labeled *periods*
+  (`window_start`–`window_end`), not a per-point human judgment — a separate table is a faithful
+  representation of the source, not a derived encoding. More importantly, it structurally prevents
+  the leak the task called out: Slice 3's feature-engineering code will have to *deliberately JOIN*
+  `raw_metrics` against `nab_anomaly_windows` (a range-containment query) to get ground truth,
+  instead of the label sitting right next to `value` where a careless `SELECT *` into a feature
+  matrix would silently include it. The **ingestion pipeline itself (producer + consumer) never
+  reads or writes `nab_anomaly_windows` at all** — that table is seeded once, separately, as
+  reference data for later evaluation/training, not part of the streaming path.
+- **Anomaly windows are seeded as literal data, not parsed from NAB's `combined_windows.json` at
+  runtime.** There are exactly 3 windows total across our 2 fixed series — hardcoding them (as a
+  small seed/migration insert) avoids depending on NAB's GitHub repo being reachable at ingestion
+  time, and avoids building a generic "parse the whole-corpus label file" loader to read 3 known
+  values. If the series list grows later, this is the first thing to replace with a real loader.
+- **Rejected**: (a) *`is_anomaly BOOLEAN` column on `raw_metrics`* — the leak risk above. (b)
+  *materializing per-point labels at write time* — same leak risk, plus it would make the label a
+  property of the row instead of the window, losing the distinction between "inside a labeled
+  anomaly window" and "NAB provides no judgment here" if that nuance ever matters later.
+
+#### AD-12. Producer: replay pacing and event time are two different clocks, kept structurally separate
+
+- **The Kafka message payload carries the CSV row's own timestamp, parsed as UTC** (NAB timestamps
+  carry no timezone; UTC is the standard community convention for this corpus) —
+  `{"series_id": "...", "timestamp": "2014-04-15T07:24:00Z", "value": 91.958}`. This value is
+  read once from the CSV and never recomputed. **`now()` is used only to control how fast rows are
+  published** (a `REPLAY_SPEED` config: e.g. `60` replays 1 simulated hour per 1 real minute,
+  `0`/unset fires rows back-to-back as fast as Kafka accepts them — the mode used for the empirical
+  verification below, since waiting out 14 real-time days per series isn't practical). These two
+  clocks — event time (from the file) and publish pacing (wall clock) — are separate variables in
+  the code so they structurally cannot be conflated into "timestamp = time of replay," which is
+  exactly the bug the task flagged as silently poisoning Slice 3's training data.
+- **Rows are read and published in file order** — verified the 2 chosen CSVs are already strictly
+  timestamp-sorted with no duplicate timestamps (checked directly: `Δt ∈ {300s, 600s}` throughout,
+  monotonically increasing) — the producer does not sort or reorder; it trusts and preserves NAB's
+  own row order.
+- **Ordering guarantee**: the topic is created explicitly (per Slice 1's AD-3, which deferred this)
+  with one partition per series, and every message is **keyed by `series_id`**. Kafka guarantees
+  per-partition ordering, so keying by series routes every row of a given series to the same
+  partition — produce order (= file order = chronological order) is preserved through to the
+  consumer.
+- **Rejected**: (a) *producer-side idempotent-producer mode* — aiokafka's support for this is not
+  as complete as e.g. the Java client's; the more meaningful idempotence guarantee for this slice is
+  at the consumer/DB boundary (AD-13), so producer-side dedup is redundant. (b) *a single shared
+  partition for both series* — would still preserve per-series order via the key's hash routing in
+  practice, but an explicit partition-per-series makes the ordering guarantee structural rather than
+  incidental.
+
+#### AD-13. Consumer: idempotent upsert + commit-after-write
+
+- **Idempotence on redelivery**: the consumer writes with
+  `INSERT INTO raw_metrics (time, series_id, value) VALUES (...) ON CONFLICT (series_id, time) DO
+  NOTHING`. A replayed NAB row is immutable data — the same `(series_id, time)` always carries the
+  same `value` — so `DO NOTHING` is the correct semantics (`DO UPDATE` was considered and rejected:
+  it would silently mask a genuine bug if two different values ever arrived for the same key,
+  instead of that being visible as a conflict).
+- **Offset commit strategy**: the consumer commits the Kafka offset for a message *only after* the
+  DB write for that message has succeeded — never before. This is at-least-once delivery
+  (a crash between DB write and offset commit reprocesses that row) combined with the idempotent
+  upsert above, which converts "at-least-once delivery" into "exactly-once effect" on the table
+  without needing Kafka transactions — overkill for this slice's scope. This is the direct answer to
+  "what happens if a message is read twice": it becomes a no-op `ON CONFLICT DO NOTHING`.
+- **TimescaleDB unavailable at write time**: the consumer retries the write with bounded exponential
+  backoff and does **not** commit the offset until a write succeeds — it blocks consumption rather
+  than dropping the message or crashing past its position. Kafka retains the message (topic
+  retention covers this small dataset's full replay window many times over), so nothing is lost;
+  the consumer simply stalls until TimescaleDB comes back, then catches up from where it left off.
+- **Writes are one row at a time** (not batched): throughput here is a few thousand rows total, so
+  batching buys nothing, and batching would complicate the idempotence story for no benefit — a
+  partially-failed batch still needs per-row retry logic, so row-at-a-time keeps commit granularity,
+  DB-write granularity, and idempotence granularity all equal to message granularity.
+
+#### AD-14. Where ingestion runs, and how the schema/topic get created
+
+- **Two new compose services, not in-process FastAPI**: AD-9 (Slice 1) explicitly deferred this
+  question to "Slice 2/4" — this is that decision. A `producer` (one-shot job: reads the 2 CSVs,
+  replays to Kafka, exits) and a `consumer` (long-running: subscribes, upserts, retries per AD-13).
+  Slice 2 has no WebSocket fan-out yet (that's Slice 4/5), so AD-9's stated argument *for*
+  in-process (avoiding an extra channel to reach the WebSocket) doesn't apply yet, while its
+  argument *against* (coupling ingestion availability to API restarts, which will be frequent
+  during Slices 3–5 development) applies immediately. Revisit when the WebSocket exists.
+- **Topic creation is explicit** (per AD-3): the producer creates the topic with
+  `AIOKafkaAdminClient.create_topics()` before publishing, idempotently (a "topic already exists"
+  response is not an error).
+- **Schema creation is a plain SQL init script, not Alembic**: two tables, no anticipated schema
+  churn yet — Alembic's versioned-migration machinery is overkill at this size (AD-8 in Slice 1
+  deferred exactly this choice). Revisit if/when the schema needs to evolve across environments.
+- **NAB CSVs are fetched by a small script (`scripts/fetch_nab_data.sh`), not committed**: consistent
+  with AD-1's `data/` being gitignored. The script pulls just the 2 chosen files from NAB's public
+  GitHub raw URLs into `data/realAWSCloudwatch/`; the producer container itself needs no internet
+  access.
+
+**Deferred (need Slice 3+ information):** any use of `nab_anomaly_windows` for training/eval
+splits; ingesting further NAB series beyond the 2 above; space-partitioning `raw_metrics`; Alembic
+migration; consumer running anywhere other than a single compose service (no horizontal scaling
+yet — not needed at this volume).
+
 ## 5. Testing Strategy
 
 _(to define per slice — QE-senior posture: not just happy-path unit tests; realistic edge cases
@@ -234,6 +388,20 @@ Nothing here has ML or streaming logic yet, so tests target wiring and failure b
 
 Real-dependency tests are marked so they run separately from the fast unit suite. Whether CI
 uses testcontainers or compose services is decided when CI is introduced.
+
+### Slice 2 — Ingestion (proposed)
+
+The task's own bar for "done" here is not "the service runs" — it's a row-by-row, source-CSV-vs-TimescaleDB
+diff:
+
+| Check | Kind | Real deps or mocks? | Why |
+|---|---|---|---|
+| Row-by-row diff: read a known slice of the source CSV, query the same time range from `raw_metrics`, assert equal `time` and `value` for every row | integration, against real stack | **real** | this is the actual claim the slice has to survive — anything less doesn't rule out the timestamp-mapping bug the task specifically warned about |
+| Row counts match exactly between source CSV and `raw_metrics` per series (no dropped/duplicated rows) | integration | **real** | catches both under-delivery (consumer crash) and the idempotence path (over-delivery from a forced consumer restart mid-replay) |
+| Anomaly window check: for both series, every timestamp NAB places inside a labeled window matches a row present in `raw_metrics`, and `nab_anomaly_windows` contains exactly the windows from `combined_windows.json` for these 2 files | integration | **real** | validates AD-11's label representation end to end, not just that the table exists |
+| Consumer restart mid-replay: kill and restart the consumer partway through, confirm no duplicate rows and no gaps once replay finishes | integration / compose | **real** | direct test of AD-13's idempotence claim, not just code review of the `ON CONFLICT` clause |
+| TimescaleDB stopped mid-replay: consumer blocks (doesn't crash, doesn't lose its offset), resumes and catches up once the DB is back | integration / compose | **real** | direct test of AD-13's retry-and-stall claim |
+| Producer emits messages keyed by `series_id` with the CSV's own timestamp in the payload (not `now()`) | unit | none — inspect produced messages directly | fast, deterministic check that the two-clocks separation in AD-12 wasn't accidentally collapsed |
 
 ## 6. Measurements Log
 
