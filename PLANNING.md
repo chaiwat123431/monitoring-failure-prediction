@@ -214,7 +214,7 @@ connect works, then the client hangs". So:
 chunk interval; Kafka topic/partition/key design; DB migration tool (Alembic vs plain SQL init
 scripts); final DB/Kafka client libraries; consumer topology (above).
 
-### Slice 2 — Ingestion (status: PROPOSED, awaiting validation — no code written yet)
+### Slice 2 — Ingestion (status: DONE)
 
 Scope guard: this slice covers exactly NAB replay → Kafka → TimescaleDB. No feature engineering, no
 model, no inference API — those are Slices 3 and 4. Verified against the real NAB corpus (fetched
@@ -389,7 +389,7 @@ Nothing here has ML or streaming logic yet, so tests target wiring and failure b
 Real-dependency tests are marked so they run separately from the fast unit suite. Whether CI
 uses testcontainers or compose services is decided when CI is introduced.
 
-### Slice 2 — Ingestion (proposed)
+### Slice 2 — Ingestion (done)
 
 The task's own bar for "done" here is not "the service runs" — it's a row-by-row, source-CSV-vs-TimescaleDB
 diff:
@@ -445,3 +445,32 @@ _(transparency on what didn't work is part of the discipline — filled in as th
   did not reproduce. Left as-is rather than adding a defensive catch-all for a failure mode that
   couldn't be triggered; this is a known-absent-evidence gap, not a confirmed-safe guarantee — worth
   revisiting if `aiokafka` is upgraded or if `/health/ready` is ever seen to 500 in practice.
+
+### Slice 2 — Ingestion
+
+- **Consumer stdout was invisible in `docker compose logs` — Python buffers stdout when it's not a
+  TTY.** First empirical pass showed the consumer stuck with no progress logs at all (only
+  `aiokafka`'s own logger output, which flushes per-record); actual DB state showed it had in fact
+  written all 8,064 rows. `print()` output was sitting in Python's block-buffered stdout inside the
+  container, invisible to `docker logs` until the buffer filled or the process exited — for a
+  long-running consumer that's effectively "never." Fixed with `ENV PYTHONUNBUFFERED=1` in
+  `backend/Dockerfile` (affects every container built from that image: backend, migrate, producer,
+  consumer). Reproduced the silent-logs state, applied the fix, rebuilt, and confirmed the
+  `consumer: N rows written` lines appear in real time before trusting any other test result that
+  depended on reading these logs.
+- **AD-13's "retries, then catches up once the DB comes back" was false as first written — the
+  consumer never actually recovered.** Caught by literally doing the test AD-13 promised, not by
+  reading the code: reset to an empty `raw_metrics`, killed `timescaledb` mid-replay
+  (`docker compose stop timescaledb`) with the consumer partway through, watched it correctly enter
+  the retry-backoff loop without crashing — then brought `timescaledb` back and watched the consumer
+  stay stuck retrying with `the connection is closed` for 20+ seconds after the DB was healthy
+  again, permanently. Root cause: `write_with_retry` retried `conn.execute(...)` on the *same*
+  `psycopg.AsyncConnection` object every time; once a connection is terminated it stays closed
+  forever, so retrying a write on it can never succeed no matter how long you wait or how healthy
+  the DB is. Fixed by replacing the bare connection with a small `ReconnectingConn` wrapper
+  (`backend/app/ingestion/consumer.py`) that discards the dead connection on any write failure and
+  opens a fresh one on the next attempt. Re-ran the identical kill/restart sequence after the fix:
+  consumer resumed on its own and reached the full 8,064/8,064 rows with zero duplicates. This is
+  exactly the kind of bug "the service is up" would never have caught — the container stayed
+  `Up` and un-crashed the entire time, both before and after the fix; only forcing the actual DB
+  outage and watching for real recovery (not just no-crash) exposed it.

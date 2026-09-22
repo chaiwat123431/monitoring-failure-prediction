@@ -7,7 +7,8 @@ RUN groupadd --gid 1000 app && useradd --uid 1000 --gid app --create-home app
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1
 
 FROM base AS dev
 
