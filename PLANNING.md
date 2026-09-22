@@ -264,3 +264,16 @@ _(transparency on what didn't work is part of the discipline — filled in as th
   and the frontend image runs as the non-root `node` user, so `next dev` failed with
   `EACCES: permission denied, mkdir '/app/.next/dev'`. Fix was to drop both named volumes rather
   than chown them.
+- **Open risk (not resolved): possible unhandled exception from `aiokafka` `producer.stop()` after
+  a timeout-cancelled `producer.start()`.** Flagged by `/code-review` in `backend/app/api/health.py`
+  `_check_kafka`: if `asyncio.wait_for` cancels `start()` mid-connection, the `finally: await
+  producer.stop()` runs against a partially-initialized client, which could in principle raise
+  something outside `_run_check`'s caught exception types (`psycopg.Error`, `KafkaError`,
+  `OSError`) and turn `/health/ready` into an unhandled 500 instead of the intended graceful 503 —
+  breaking AD-6's "never a stack trace" guarantee. Tried to reproduce it directly: ran the real
+  `_check_kafka`/`_run_check` code and the live HTTP endpoint against a blackholed address
+  (`10.255.255.1`, TCP SYN gets no response) with `asyncio.wait_for` timeouts from 1ms to 500ms, on
+  the pinned `aiokafka==0.12.0`. Every run resolved cleanly to `503 {"kafka": "error: timeout"}` —
+  did not reproduce. Left as-is rather than adding a defensive catch-all for a failure mode that
+  couldn't be triggered; this is a known-absent-evidence gap, not a confirmed-safe guarantee — worth
+  revisiting if `aiokafka` is upgraded or if `/health/ready` is ever seen to 500 in practice.
