@@ -8,7 +8,7 @@ import asyncio
 import csv
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from aiokafka import AIOKafkaProducer
@@ -16,15 +16,11 @@ from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.errors import TopicAlreadyExistsError
 
 from app.config import settings
-from app.ingestion.series_registry import SERIES
+from app.ingestion.series_registry import SERIES, parse_nab_timestamp
 
 TOPIC = "raw-metrics"
 DATA_DIR = Path(os.environ.get("NAB_DATA_DIR", "/data"))
 REPLAY_SPEED = float(os.environ.get("REPLAY_SPEED", "0"))  # 0 = as fast as possible
-
-
-def parse_ts(raw: str) -> datetime:
-    return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
 
 
 async def ensure_topic() -> None:
@@ -47,7 +43,7 @@ async def replay_series(producer: AIOKafkaProducer, series) -> int:
     count = 0
     with path.open(newline="") as f:
         for row in csv.DictReader(f):
-            ts = parse_ts(row["timestamp"])
+            ts = parse_nab_timestamp(row["timestamp"])
             if REPLAY_SPEED > 0 and prev_ts is not None:
                 delay = (ts - prev_ts).total_seconds() / REPLAY_SPEED
                 if delay > 0:

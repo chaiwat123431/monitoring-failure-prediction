@@ -6,14 +6,14 @@ the real NAB CSVs in `data/` (see scripts/fetch_nab_data.sh).
 """
 
 import csv
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import psycopg
 import pytest
 
 from app.config import settings
-from app.ingestion.series_registry import SERIES
+from app.ingestion.series_registry import SERIES, parse_nab_timestamp
 
 pytestmark = pytest.mark.integration
 
@@ -25,9 +25,7 @@ def _read_csv(series) -> list[tuple[datetime, float]]:
     rows = []
     with path.open(newline="") as f:
         for row in csv.DictReader(f):
-            ts = datetime.strptime(row["timestamp"], "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc
-            )
+            ts = parse_nab_timestamp(row["timestamp"])
             rows.append((ts, float(row["value"])))
     return rows
 

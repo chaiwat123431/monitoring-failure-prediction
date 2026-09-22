@@ -5,6 +5,11 @@ offset is committed only after the DB write for that message has succeeded, so a
 write and commit just reprocesses that row into a no-op on restart. If TimescaleDB is down, the
 write is retried with backoff and the offset is not advanced — consumption stalls, nothing is
 dropped, and it catches up once the DB comes back.
+
+A message that can never succeed — unparseable JSON, a missing field, or a value the DB rejects
+outright (not a connectivity error) — is logged and skipped (offset committed) rather than
+retried forever or left to crash the process: retrying a message that is itself the problem does
+not help, and blocks every message behind it indefinitely.
 """
 
 import asyncio
@@ -47,14 +52,29 @@ class ReconnectingConn:
             await self._conn.close()
 
 
+def parse_message(raw_bytes: bytes) -> dict:
+    """Raises json.JSONDecodeError / KeyError / TypeError / ValueError on anything malformed —
+    the caller treats all of those as "skip this message", never as a reason to crash."""
+    raw = json.loads(raw_bytes)
+    return {
+        "series_id": raw["series_id"],
+        "timestamp": raw["timestamp"],
+        "value": float(raw["value"]),
+    }
+
+
 async def write_with_retry(db: ReconnectingConn, payload: dict) -> None:
+    """Retries forever on connectivity failures (OperationalError/OSError) — those recover once
+    the DB comes back. Any other psycopg.Error (e.g. a value the column rejects) means the *data*
+    is the problem, not the connection: retrying it changes nothing, so it's raised for the
+    caller to skip-and-log instead of looping forever on an unwritable message."""
     delay = 0.5
     while True:
         try:
             conn = await db.get()
             await conn.execute(UPSERT_SQL, payload)
             return
-        except (psycopg.Error, OSError) as exc:
+        except (psycopg.OperationalError, OSError) as exc:
             print(f"consumer: DB write failed, retrying in {delay}s: {exc}")
             db.discard()
             await asyncio.sleep(delay)
@@ -72,16 +92,32 @@ async def main() -> None:
     await consumer.start()
     db = ReconnectingConn(settings.database_url)
     written = 0
+    skipped = 0
     try:
         async for msg in consumer:
-            payload = json.loads(msg.value)
-            await write_with_retry(db, payload)
+            where = f"partition={msg.partition} offset={msg.offset}"
+            try:
+                payload = parse_message(msg.value)
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                print(f"consumer: skipping unparseable message ({where}): {exc}")
+                await consumer.commit()
+                skipped += 1
+                continue
+
+            try:
+                await write_with_retry(db, payload)
+            except psycopg.Error as exc:
+                print(f"consumer: skipping message the DB permanently rejected ({where}): {exc}")
+                await consumer.commit()
+                skipped += 1
+                continue
+
             await consumer.commit()
             written += 1
             if written % 500 == 0:
                 print(f"consumer: {written} rows written")
     finally:
-        print(f"consumer: shutting down, {written} rows written this run")
+        print(f"consumer: shutting down, {written} rows written, {skipped} skipped this run")
         await consumer.stop()
         await db.close()
 

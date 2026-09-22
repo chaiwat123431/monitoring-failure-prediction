@@ -474,3 +474,34 @@ _(transparency on what didn't work is part of the discipline — filled in as th
   exactly the kind of bug "the service is up" would never have caught — the container stayed
   `Up` and un-crashed the entire time, both before and after the fix; only forcing the actual DB
   outage and watching for real recovery (not just no-crash) exposed it.
+- **A malformed message crashed the consumer outright, and `restart: unless-stopped` turned that
+  into a permanent crash-restart loop.** Flagged by `/code-review`, reproduced directly: published
+  a non-JSON garbage message to `raw-metrics` and watched the consumer die on an uncaught
+  `json.JSONDecodeError`, restart, hit the same uncommitted message again, and die again —
+  confirmed via `docker inspect --format '{{.RestartCount}}'` climbing (4 and counting) rather than
+  stabilizing. A second, related case: a well-formed JSON message with a DB-unwritable value (e.g.
+  a non-numeric `value`, or `series_id: null` against the `NOT NULL` constraint) hit
+  `write_with_retry`'s blanket `except psycopg.Error` and was retried forever with exponential
+  backoff — a permanent data problem misclassified as a transient connectivity one, silently
+  stalling that partition forever with no crash and no error surfaced anywhere. Fixed both with the
+  same principle: a message that can never succeed is logged and skipped (offset committed), not
+  retried forever or left to crash the process. Concretely — `parse_message()` in
+  `backend/app/ingestion/consumer.py` extracts and validates the 3 fields up front, and
+  `write_with_retry` now only retries `psycopg.OperationalError`/`OSError` (genuine connectivity
+  failures); any other `psycopg.Error` propagates so the caller can skip it instead of looping.
+  Re-ran the identical garbage-message and bad-value/null-value reproductions after the fix,
+  interleaved with valid messages: all bad messages were logged and skipped, all valid messages on
+  either side were written correctly, and `RestartCount` stayed at `0` throughout. Added
+  `backend/tests/unit/test_consumer.py` as a permanent regression test for both cases (no real
+  Kafka/DB needed — a fake connection object simulates the operational-vs-permanent-error split).
+- **Considered and rejected: batching Kafka sends/commits for throughput.** `/code-review` also
+  flagged that the producer awaits each `send_and_wait` individually (no pipelining) and the
+  consumer commits its Kafka offset after every single row (no batching). Measured both before
+  deciding: a full producer replay of both series (8,064 messages, `REPLAY_SPEED=0`) completes in
+  ~4s wall time including container startup, and the consumer's full catch-up from empty takes
+  ~8.5s including consumer-group-join overhead — both single-digit seconds for this project's
+  actual dataset size. AD-13 already chose row-at-a-time deliberately, to keep commit granularity,
+  DB-write granularity, and idempotence granularity all equal (§4, AD-13); batching would reintroduce
+  partial-batch-failure handling for a throughput problem that doesn't exist at this scale. Not
+  applied — revisit only if the dataset size changes materially (e.g. ingesting the full NAB
+  corpus, which AD-10 explicitly deferred).
