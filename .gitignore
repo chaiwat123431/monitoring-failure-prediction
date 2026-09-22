@@ -4,3 +4,7 @@ __pycache__/
 .env
 *.pyc
 .next/
+data/
+.pytest_cache/
+*.egg-info/
+*.tsbuildinfo
