@@ -2,8 +2,8 @@ FROM node:22-slim AS dev
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY . .
 RUN chown -R node:node /app

@@ -14,7 +14,8 @@ docker compose up --build -d
 
 echo "Waiting for backend healthcheck..."
 for _ in $(seq 1 60); do
-  status=$(docker compose ps --format json backend | python3 -c "import json,sys; print(json.load(sys.stdin).get('Health',''))" 2>/dev/null || echo "")
+  cid=$(docker compose ps -q backend)
+  status=$(docker inspect --format '{{.State.Health.Status}}' "$cid" 2>/dev/null || echo "")
   if [ "$status" = "healthy" ]; then
     break
   fi
