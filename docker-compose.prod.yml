@@ -44,6 +44,13 @@ services:
       context: ./backend
       <<: *prod-build
     command: ["python", "scripts/train.py"]
+    # `train` has no entry in docker-compose.yml to inherit environment from (it's new, prod-only) —
+    # docker-compose.yml's `x-backend-env` anchor is scoped to that file and can't be referenced
+    # across files, so these are spelled out here rather than aliased (same values, same convention).
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD}@timescaledb:5432/${POSTGRES_DB:-monitoring}
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      MODEL_PATH: /app/models/isolation_forest.joblib
     volumes: !override
       - ./models:/app/models
     profiles: ["tools"]
