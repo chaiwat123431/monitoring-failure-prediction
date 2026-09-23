@@ -1,0 +1,156 @@
+# PLANNING.md Slice 6 (AD-30..AD-35): the prod deployment shape for Fly.io — deliberately a
+# separate file, not edits to docker-compose.yml (AD-31), so local dev is entirely unaffected.
+#
+# Differences from docker-compose.yml, and why (all per AD-31, researched against Fly's actual
+# compose-deploy constraints, not guessed):
+#   - `build:` -> `image:` for every app-owned service. Fly's compose deploy allows only one `build:`
+#     entry in the whole file; backend/migrate/producer/consumer/frontend must reference pre-built,
+#     pre-pushed images instead (see deploy/fly/README.md for the build+push step this requires
+#     before `fly deploy`).
+#   - Service-name DNS (`redpanda:9092`, `timescaledb:5432`) -> `localhost` addressing. A Fly compose
+#     Machine's containers share one network namespace, not compose's own per-stack bridge network.
+#   - No dev bind-mounts (`./backend/app`, `./frontend/src`) — the prod images already bake the code
+#     in; nothing to hot-reload on a public host.
+#   - Redpanda's external listener (AD-3, for host-side tools) is dropped — nothing outside the
+#     Machine needs to reach it directly in prod; the producer/consumer run as containers on the same
+#     Machine and already use the internal listener.
+#   - A 5th service, `caddy` (AD-34): the one public entry point, path-routing to backend/frontend
+#     over the same localhost addressing everything else here uses.
+#
+# Least-verified part of this file (stated plainly, per AD-34): the exact mapping from this file's
+# top-level `volumes:` to Fly Volumes (declared separately via `fly volumes create` + fly.toml's
+# `[[mounts]]`), and whether Fly's compose engine passes `fly secrets` through as the `${VAR}`
+# substitutions used below the same way a local `.env` file does for docker-compose.yml today —
+# both assumed here by direct analogy with documented Fly/compose behavior, to be confirmed (and
+# this file corrected if reality disagrees) against the real first `fly deploy`.
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v22.2.4
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --kafka-addr=internal://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://localhost:9092
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  timescaledb:
+    image: timescale/timescaledb:2.30.1-pg17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: monitoring
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d monitoring"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    image: ${IMAGE_REGISTRY}/mfp-backend:prod
+    environment:
+      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      MODEL_PATH: /app/models/isolation_forest.joblib
+      CORS_ALLOWED_ORIGINS: https://${FLY_APP_NAME}.fly.dev
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  migrate:
+    image: ${IMAGE_REGISTRY}/mfp-backend:prod
+    command: ["python", "-m", "app.ingestion.migrate"]
+    environment:
+      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: "no"
+
+  # AD-35: kept manual/one-shot in prod, exactly like local dev — run by hand
+  # (`fly ssh console` + `docker compose run --rm producer`) before pointing anyone at the demo, not
+  # on a schedule. Set REPLAY_SPEED=3600 (not 0) so a visitor can actually watch it stream — the full
+  # ~336h series then replays in ~5.6 real minutes instead of a few seconds.
+  producer:
+    image: ${IMAGE_REGISTRY}/mfp-backend:prod
+    command: ["python", "-m", "app.ingestion.producer"]
+    environment:
+      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      NAB_DATA_DIR: /data
+      REPLAY_SPEED: "3600"
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  consumer:
+    image: ${IMAGE_REGISTRY}/mfp-backend:prod
+    command: ["python", "-m", "app.ingestion.consumer"]
+    environment:
+      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  frontend:
+    # NEXT_PUBLIC_API_URL is not set here: it's baked into this image at `docker build` time
+    # (AD-32), not read at container start — see deploy/fly/README.md's build step.
+    image: ${IMAGE_REGISTRY}/mfp-frontend:prod
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  caddy:
+    image: caddy:2-alpine
+    volumes:
+      - ./deploy/fly/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  redpanda_data:
+  timescaledb_data:

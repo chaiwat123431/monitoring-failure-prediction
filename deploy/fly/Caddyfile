@@ -1,0 +1,17 @@
+# PLANNING.md Slice 6 AD-34: pure internal path routing, one public hostname.
+# Fly's own edge proxy terminates TLS for the app's *.fly.dev hostname and forwards plain HTTP to
+# this port (fly.toml's [http_service].internal_port) — Caddy has no ACME/certificate config of its
+# own to do here, only routing.
+:8080 {
+	handle /api/* {
+		reverse_proxy localhost:8000
+	}
+
+	handle /ws/* {
+		reverse_proxy localhost:8000
+	}
+
+	handle {
+		reverse_proxy localhost:3000
+	}
+}

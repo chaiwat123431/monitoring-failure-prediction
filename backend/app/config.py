@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str
     ready_check_timeout_seconds: float = 2.0
     model_path: Path = _DEFAULT_MODEL_PATH
+    # Comma-separated, not JSON — stays consistent with every other plain-string .env value in this
+    # project (PLANNING.md AD-33); dev's own default matches the frontend's dev-server origin (AD-7).
+    cors_allowed_origins: str = "http://localhost:3000"
+
+    @property
+    def cors_allowed_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]
 
 
 settings = Settings()
