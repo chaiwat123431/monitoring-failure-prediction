@@ -695,3 +695,33 @@ _(transparency on what didn't work is part of the discipline — filled in as th
   (checked the same `pd.Timedelta` calls under `-W error::DeprecationWarning` again, clean). No
   other code changes needed — `compute_features`'s pandas API surface (`.rolling()`, `.diff()`,
   groupby) is unchanged between 2.3 and 3.0 for what this project uses.
+- **A mid-series gap >= the 60-minute window produced a NaN-shaped feature row instead of being
+  dropped.** Flagged by `/code-review`, reproduced directly: a series with a 90-minute gap
+  partway through (not at the start — AD-15's existing leading-rows drop only guards the start)
+  produces `rolling_std_1h = NaN` on the row right after the gap, because that row's own trailing
+  window contains only itself, even though `has_full_window` (which only checks distance from the
+  *series'* start, not from the row's own preceding sample) passes. Checked whether this actually
+  crashes training as the report suggested: it doesn't — `IsolationForest.fit()`/`.predict()` on
+  `sklearn==1.9.1` tolerate `NaN` natively (`allow_nan=True` in its sklearn tags), so this
+  wouldn't have thrown. Fixed anyway: a NaN-shaped row isn't a real "normal" or "anomalous"
+  feature vector, it's a data-quality artifact from missing monitoring data, and `app/ml/features.py`
+  is explicitly the same code Slice 4's live Kafka-fed inference will use, where real gaps
+  (broker downtime, consumer lag) are plausible in a way they aren't in the closed 2-series NAB
+  replay. `compute_features` now drops any row with a NaN in `FEATURE_NAMES` as a final step.
+  Confirmed against the real ingested data that this changes nothing today (max real gap is 10
+  minutes, per AD-15 — `compute_features` output and `scripts/train.py`'s metrics are
+  bit-for-bit identical before and after the fix) and added a permanent unit test reproducing the
+  90-minute-gap case.
+- **`test_rolling_state_never_crosses_a_series_boundary` didn't actually test what it claimed —
+  its two synthetic series were 5 calendar months apart, so a 60-minute window could never reach
+  across them regardless of whether the code grouped by `series_id` correctly.** Proved this
+  concretely rather than taking the report's word for it: wrote a deliberately un-grouped
+  "buggy" version of `compute_features` (a single global time-sorted rolling window, ignoring
+  `series_id` entirely) and ran the *existing* test against it — it passed, confirming a real
+  cross-series-leakage regression would have shipped silently. Fixed by giving both series the
+  *same* timestamps instead of ones 5 months apart (so a real leak, if introduced, would visibly
+  blend their very different values); re-ran the same "buggy" version against the *new* test and
+  confirmed it now correctly fails.
+- **Minor: `compute_features` re-sorted each per-series group by time after already sorting the
+  whole frame by `(series_id, time)` up front** — confirmed the second sort was a genuine no-op
+  (`group['time'].is_monotonic_increasing` was already `True` for every group) and removed it.
