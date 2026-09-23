@@ -928,7 +928,7 @@ All of the above were restored to their original state afterward (`models/isolat
 moved back, `backend` restarted once more, confirmed healthy and scoring again) before this section
 was written.
 
-### Slice 6 — Deployment (status: PROPOSED — revised architecture, pending validation; supersedes an earlier Fly.io-based version that was implemented, tested against a real account, and reverted — see PLANNING §7 for the full story of that pivot, not glossed over here)
+### Slice 6 — Deployment (status: DONE — live on a real Hetzner VPS; supersedes an earlier Fly.io-based version that was implemented, tested against a real account, and reverted — see PLANNING §7 for the full story of that pivot, not glossed over here)
 
 Scope guard: deploy the existing 4-service stack (Slices 1–5, frozen) to one public host, as close to
 `docker-compose.yml` as the host allows — not a re-architecture into per-provider managed services.
@@ -1668,3 +1668,51 @@ Re-verified after all of the above: `docker compose config` against the real mer
 exactly as intended (backend `:ro` restored, `train` excluded from `--services`/`up -d` but runnable
 via `run --rm train`, every prod-target service correctly using the shared anchor); `!override`
 re-confirmed on the real server.
+
+**The first real deploy to the Hetzner VPS found three more real bugs — none of them visible from
+`docker compose config`, local `docker run` smoke tests, or code review, only from actually deploying:**
+
+- **The frontend healthcheck failed with `ECONNREFUSED`, despite the server logging `✓ Ready`.**
+  Docker sets a `HOSTNAME` env var in every container (the container's own id), and Next.js's
+  standalone `server.js` binds to `process.env.HOSTNAME` when present — so it was silently listening
+  only on the container's bridge IP, never on `127.0.0.1`. Invisible in every prior local check: a
+  plain `docker run -p host:container` reaches the container via its bridge IP regardless of which
+  interface the process bound to inside, so the port mapping "worked" locally even with this bug
+  present. Only a healthcheck run *inside* the container's own network namespace — exactly what
+  Compose does, and exactly what a real deploy exercises that a local smoke test didn't — actually
+  probes `localhost` and exposed it. Confirmed root cause by reading `/proc/net/tcp` inside the
+  running container (the listening socket's local address was the container's own bridge IP, not
+  `0.0.0.0` or `127.0.0.1`) before fixing, not guessed. Fixed with `ENV HOSTNAME=0.0.0.0` in
+  `frontend/Dockerfile`'s `prod` stage — the standard, documented fix for this exact Next.js standalone
+  Docker gotcha.
+- **`train` had no `environment:` block at all** — a leftover gap from when the service was added
+  during the *previous* `/code-review high` pass (which caught the missing `build.context` on the same
+  new-service-with-no-base-file-entry problem, but not this second instance of it). `docker-compose.yml`'s
+  `x-backend-env` anchor is scoped to that file and isn't referenceable from `docker-compose.prod.yml`
+  in a multi-file merge — confirmed the hard way: `scripts/train.py` failed immediately with a pydantic
+  `ValidationError` (`database_url`/`kafka_bootstrap_servers` required) when actually run against the
+  deployed server. Fixed by spelling out the same three values directly in `train`'s own `environment:`
+  block (the same values, not aliased — YAML anchors don't cross files).
+- **`models/` didn't exist on the fresh VPS checkout (gitignored, AD-19) — Docker auto-created it,
+  root-owned, on first bind mount, and the container's uid-1000 `app` user couldn't write to it.**
+  `scripts/train.py` got through loading data, computing features, and fitting the model, then failed
+  on the very last line (`joblib.dump`) with `PermissionError`. This will reproduce on *any* fresh
+  clone, not just this one server — documented in `deploy/vps/README.md` as a one-time
+  `mkdir -p models && chown 1000:1000 models` step rather than silently working around it in code (the
+  underlying cause — a host directory Docker creates root-owned when it doesn't exist yet — isn't
+  something the container image itself can fix).
+- **A real near-miss, caught before it caused damage, not after**: the first producer replay was
+  triggered via `docker compose run --rm producer` without noticing that `docker compose up -d --build`
+  had *already* started `producer-1` automatically per its own service definition — for several minutes
+  both were replaying the same two series concurrently before this was noticed. Rather than trust that
+  nothing bad happened, the exact safe-recovery sequence AD-35 already specifies for this class of
+  problem was run for real: `TRUNCATE raw_metrics`, restart `backend` (fresh, empty buffers reseeded
+  from a genuinely empty table), then one single clean producer replay — confirmed afterward with
+  `SELECT series_id, count(*) FROM raw_metrics GROUP BY series_id` returning exactly 4,032 rows per
+  series (AD-10), not a suspicious over- or under-count.
+
+The live deployment (`https://89.167.113.165.sslip.io` at the time of writing) was confirmed serving
+real data end-to-end after all of the above: `/health`, `/api/series`, `/api/model` (200, real
+metadata) all correct, and the training run's precision/recall/F1 numbers matched this document's own
+Slice 3 measurements log exactly (0.126/0.825/0.218 for `ec2`, 0.322/0.769/0.454 for `rds`) — the same
+model, the same data, now running on a public host instead of a laptop.

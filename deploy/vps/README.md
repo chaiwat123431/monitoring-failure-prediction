@@ -41,6 +41,15 @@ EOF
 `.env.prod` is gitignored (confirmed: it's a literal entry, not just the broader `.env` pattern) —
 `git status` inside this checkout should never show it as trackable.
 
+`models/` is also gitignored (AD-19) and so doesn't exist yet in a fresh checkout — Docker
+auto-creates it, **root-owned**, the first time it's bind-mounted, but the backend/train containers
+run as uid 1000 (`backend/Dockerfile`), so `scripts/train.py` fails with `PermissionError` until this
+is fixed once:
+
+```bash
+mkdir -p models && chown 1000:1000 models
+```
+
 `PUBLIC_HOSTNAME` uses [sslip.io](https://sslip.io) — a public DNS service that resolves
 `<ip>.sslip.io` to `<ip>` with no domain purchase or DNS setup needed (confirmed by resolving it
 directly with `dig` before relying on it here). Let's Encrypt (Caddy's automatic HTTPS) only needs a
