@@ -700,6 +700,235 @@ process — fine for single-user MVP, PLANNING §2; would need a real consumer g
 if the API were ever run with >1 replica); a model hot-reload endpoint (retraining policy already
 deferred in AD-19).
 
+### Slice 5 — Frontend (status: DONE)
+
+Scope guard: this slice covers only the Next.js/Recharts dashboard consuming the existing API
+(Slice 4, frozen). No change to `backend/`, `docker-compose.yml`'s non-frontend services, ingestion,
+or the model. All endpoint/field names below are read directly from `app/api/metrics.py` and
+`app/api/ws.py`, not assumed from PLANNING's own AD-20/22/23 prose.
+
+#### AD-25. Component structure: one dashboard page, a data-fetching hook holding all state, dumb presentational components
+
+```
+frontend/src/
+├── app/
+│   ├── layout.tsx            # existing, untouched apart from <title>/metadata
+│   └── page.tsx              # composes the dashboard; owns the selected series_id
+├── components/
+│   ├── SeriesSelector.tsx    # <select> populated from GET /api/series
+│   ├── ModelStatusBanner.tsx # renders only when model_loaded === false
+│   ├── ConnectionBadge.tsx   # renders the WS connection state
+│   ├── MetricChart.tsx       # Recharts composed chart (line + scatter overlay + window bands)
+│   └── AlertsPanel.tsx       # list of is_anomaly === true points, most recent first
+├── hooks/
+│   └── useLiveSeries.ts      # AD-26/AD-27: history fetch + WS + reconnect + gap-fill, one hook
+└── lib/
+    ├── api.ts                # typed fetch wrappers: getSeries(), getHistory(id, range)
+    ├── types.ts              # TS types mirroring the API's actual JSON shapes verbatim
+    └── config.ts             # NEXT_PUBLIC_API_URL (already wired, docker-compose.yml AD-7) → http(s)
+                               # base + derived ws(s) base for the live socket
+```
+
+- `page.tsx` holds exactly one piece of state, `selectedSeriesId`, and fetches `GET /api/series`
+  once on mount to populate `SeriesSelector`; everything else for the *selected* series (history,
+  live points, connection state, model status) lives inside `useLiveSeries(selectedSeriesId)`, so
+  switching series is "unmount the old hook instance, mount a new one" rather than a pile of
+  `if (seriesId changed) reset(...)` logic spread across components.
+- Layout: a header row (`SeriesSelector` + `ConnectionBadge`, both small and always visible),
+  `ModelStatusBanner` directly under it (full-width, only rendered when relevant), then a two-column
+  body — `MetricChart` (primary, wide) and `AlertsPanel` (narrow side column) — collapsing to
+  stacked on narrow viewports. This is a portfolio dashboard, not a design-system deliverable, so no
+  extra chrome (tabs, settings, theming) beyond what the 5 requirements below need.
+- **Rejected**: (a) *a state-management library (Redux/Zustand/Context-as-store)* — one hook, one
+  page, two consumer components; React's own state is enough at this scope and a library would be
+  unused-abstraction weight. (b) *one "smart" `MetricChart` that fetches its own data* — keeping data
+  fetching in a hook and charts/panels presentational makes `AlertsPanel` and `MetricChart` trivially
+  testable/storyboardable against fixed prop data, and keeps exactly one code path that talks to the
+  network.
+
+#### AD-26. Data lifecycle: `/history` fetched with a deliberately wide, fixed bracket — not the dataset's real date range
+
+- On mount (and on every `selectedSeriesId` change), `useLiveSeries` calls
+  `GET /api/series/{id}/history?start=<HISTORY_RANGE_START>&end=<HISTORY_RANGE_END>` **exactly
+  once**, seeds chart state from its `history` array, then opens the WebSocket for the live tail —
+  never a poll loop calling `/history` on an interval. This is the literal contract AD-23 documents
+  ("call `/history` for the initial range, then open the WebSocket for the tail").
+- **The two constants are a fixed, wide bracket** (`HISTORY_RANGE_START = 2000-01-01T00:00:00Z`,
+  `HISTORY_RANGE_END = 2100-01-01T00:00:00Z`), not the two NAB series' real 2014 date ranges from
+  AD-16. **Why this is the item most worth your validation**: AD-20 made `start`/`end` both
+  required with no server-side default specifically because "there's no give-me-everything use case
+  worth guessing a default for" at this dataset's *size* — but that's a statement about row count
+  (4,032 rows/series, trivial), not about the frontend needing to know the *real* boundary dates.
+  The only way to learn the real range without guessing would be a new field on `GET /api/series`
+  (e.g. `first_time`/`last_time`) — a backend change this slice's scope guard forbids. A wide,
+  fixed bracket gets the same practical result (every row currently in `raw_metrics` for that
+  series, regardless of when ingestion happens to have reached) without embedding this slice's
+  frontend code with knowledge of a specific dataset's specific calendar dates, and without
+  depending on client wall-clock time (which bears no relationship to the events' 2014 timestamps,
+  since AD-12 pointed out event time and replay-pacing wall time are unrelated clocks).
+- **Rejected**: (a) *hardcoding each series' real min/max timestamp from AD-16* — works today, but
+  ties the frontend to values that live in this document, not in an API response; a future series
+  added to `SERIES` (AD-10) would silently render an empty chart until someone remembered to update
+  a second hardcoded table. (b) *`end = new Date()` (client "now")* — technically works (any bound
+  at or after the true max returns the same rows) but reads as if it means something ("up to the
+  present moment") when the data's own event time is nowhere near the present; a clearly-synthetic
+  far-future constant doesn't invite that misreading. (c) *no `end` bound / omit the param* — AD-20
+  requires both params; not an option without a backend change.
+
+#### AD-27. WebSocket client: exponential-backoff reconnect, and a re-`/history` gap-fill on every reconnect — confirmed against AD-23, not assumed
+
+- **Not polling**: after the one `/history` call in AD-26, the only ongoing data source is
+  `new WebSocket(\`${WS_BASE}/ws/series/${id}/live\`)`; no `setInterval` anywhere re-fetches
+  `/history` on a timer.
+- **Reconnection**: on `onclose` or `onerror`, `useLiveSeries` retries with exponential backoff
+  (250ms → 500ms → 1s → … capped at 8s, uncapped attempt count — a single-user dev/demo dashboard
+  left open has no reason to ever give up) and exposes a `connectionState` of
+  `"connecting" | "open" | "reconnecting" | "closed"` (`"closed"` only after an explicit unmount or
+  a server close with code 1008 for an unknown `series_id`, which shouldn't happen from a value the
+  dashboard itself populated from `/api/series`) — `ConnectionBadge` renders this directly, so a
+  disconnect is always visible, never silent.
+- **Gap-fill on reconnect, confirmed as the right read of AD-23, not a guess**: AD-23 states the
+  socket never replays missed history and that `/history` is the caller's tool for "what happened
+  before now" over *any* range the caller chooses — it does not say the caller may only use that
+  tool once at mount. So on every successful reconnect (not the first connect), `useLiveSeries`
+  calls `GET /api/series/{id}/history?start=<timestamp of the last point currently held>&end=<the
+  same far-future constant from AD-26>`, merges the returned `history` array into existing state
+  keyed by `time` (a plain `Map` dedupes overlap — the boundary point at `start` is fetched again on
+  purpose rather than tracked as an exclusive bound, which is simpler and costs one duplicate row),
+  and only then resumes appending live WS messages. **The alternative — accept the gap and let the
+  chart show a visible hole** — was rejected: a `raw_metrics` row's `time` is the point's real event
+  time, so a reconnect gap here means an actual missing measurement or missing anomaly flag on the
+  chart, and this project already has the exact tool (`/history`) built to answer "what happened in
+  this range" — not using it would be answering the assignment's own question ("que fait le
+  frontend pendant la reconnexion ?") with a shrug when a correct answer is directly available.
+  **Cost, stated plainly**: on a long/flappy disconnect this refetches a small range every time,
+  and if the socket is down for the whole `HISTORY_RANGE` bracket at connect time, this degrades to
+  exactly AD-26's mount-time fetch, which is fine — the dataset is a few thousand rows total.
+- **`WebSocketDisconnect`/close vs. genuine network drop are not distinguished client-side** (the
+  browser `WebSocket` API doesn't expose that distinction on `onclose`), so both go through the same
+  reconnect-and-gap-fill path — a deliberate simplification, matching the backend's own
+  "reconnect is just a new `connect()`, no session state" stance (AD-23).
+- **Rejected**: (a) *no reconnect (page-refresh-to-recover)* — a single dropped WS shouldn't require
+  the user to reload; the backend already treats reconnects as free (AD-23). (b) *reconnect without
+  gap-fill* — addressed above. (c) *a fixed reconnect delay instead of backoff* — a fixed short
+  delay hammers the backend during a real outage (e.g. `backend` restarting after a code change
+  during this slice's own development); backoff is one `setTimeout` more complex and avoids that.
+
+#### AD-28. Visual encoding: `is_anomaly` is a 3-state field, and NAB ground truth is drawn differently from model predictions
+
+- **Chart** (`MetricChart`, Recharts `ComposedChart`): the raw `value` series is one continuous
+  `Line` in a neutral color, always drawn regardless of anomaly/model state — the line must never
+  visually disappear just because the model is absent (AD-29). On top of it, a `Scatter` layer plots
+  every point with a marker whose color/shape is a function of `is_anomaly`:
+  - `false` → small filled circle, muted/neutral color (a point the model checked and called normal
+    — visually recedes, it's the expected case).
+  - `true` → filled circle, alert color (red/orange), slightly larger — a real detection, meant to
+    draw the eye.
+  - `null` → a distinct outline-only / hollow marker in a grey tone — **explicitly not styled as
+    either "normal" or "absent-from-chart"**, so a viewer can tell "no model was available for this
+    point" apart from "the model checked and it was fine," per AD-24's own point that conflating
+    those would be dishonest.
+  - A small legend under the chart names all three states explicitly (this is the one place a
+    generic 2-state anomaly chart would silently collapse `null` into `false`, which is exactly the
+    mistake being avoided here).
+  - **NAB's `labeled_windows` (AD-20) are rendered separately from the point markers above** — as
+    shaded vertical bands (Recharts `ReferenceArea`) behind the line, one per `{window_start,
+    window_end}` — never as extra scatter points and never in the same visual language as
+    `is_anomaly`. This preserves, at the chart itself, the same distinction AD-11/AD-20 built into
+    the data model: "NAB says this period was anomalous" (ground truth, a period) is a different
+    kind of claim than "the model flagged this exact point" (a prediction, a point), and the Slice 3
+    metrics (AD-17, precision ~0.18–0.32 combined) mean the two will visibly *disagree* on real
+    data — the chart should make that disagreement legible, not paper over it by drawing both the
+    same way.
+- **AlertsPanel** lists only `is_anomaly === true` points (most recent first, capped to e.g. the
+  last 50 to keep the list bounded during a long-running session), each showing timestamp + value;
+  it does not list `null` points (that's the banner's job, AD-29) or ground-truth windows (shown on
+  the chart's shaded bands, not duplicated as a second list).
+- **Rejected**: (a) *`is_anomaly == null` treated as `false` (silently "not anomalous")* — this is
+  the exact 2-state collapse AD-24 was written to prevent at the API layer; doing it in the
+  frontend would undo that at the last step. (b) *a 4th visual state for "inside a labeled window
+  AND flagged by the model"* — would require per-point band/marker interaction logic for a
+  distinction the shaded-band + marker overlay already conveys spatially (a red marker sitting
+  inside a shaded band reads as "the model correctly caught this" without a special-cased color).
+
+#### AD-29. `model_loaded: false`: a persistent, reactive banner — not a silently empty alerts panel
+
+- **Source of truth is reactive, not a one-time check**: both `GET /api/series/{id}/history`'s
+  top-level `model_loaded` field (AD-26's initial fetch) and every live WS message's own
+  `model_loaded` field (AD-22 — the live feed broadcasts this per message, not just once) feed the
+  same `modelLoaded` state in `useLiveSeries`. If `backend` is restarted mid-session after
+  `scripts/train.py` finally produces `models/isolation_forest.joblib` (AD-24's own documented
+  recovery path), the *next* live message flips `model_loaded` to `true` and the banner disappears
+  without a page reload — the dashboard doesn't need its own polling of `/api/model` to learn this,
+  since the live feed already carries the flag on every message.
+- **`ModelStatusBanner`** renders a persistent (non-auto-dismissing) warning banner exactly when
+  `modelLoaded === false`: *"No trained model detected — anomaly detection is unavailable. All
+  points are shown as unscored. Run `scripts/train.py` to enable detection."* — visible the whole
+  time the condition holds, not a toast that disappears before the user reads it.
+  `GET /api/model` itself is **not** additionally polled by the dashboard for this — AD-26/AD-27
+  already establish `/history` + the live feed as the two data sources, and both already carry
+  `model_loaded`; calling `/api/model` too would be a third source of the same one boolean fact for
+  no added information (it's useful for a human hitting the endpoint directly, per AD-20, not for
+  this dashboard's own state).
+  While this holds, the chart still renders the raw `value` line in full (AD-28's "line never
+  disappears") — every point's marker is the `null`-state hollow marker described in AD-28, so the
+  banner and the chart tell a consistent story instead of the chart silently looking identical to
+  "the model checked everything and found nothing."
+- **Rejected**: (a) *hiding `AlertsPanel` entirely when no model is loaded* — silent absence is
+  exactly the failure mode the task named ("au lieu de juste masquer silencieusement les alertes");
+  an explicit banner plus an panel that's empty *for a stated reason* (its own empty-state message
+  echoing the banner) is the honest version. (b) *polling `/api/model` on an interval* — redundant
+  with the always-present `model_loaded` field on both existing data sources, per above.
+
+**Deferred (need Slice 6+ information or explicit go-ahead):** any authentication/multi-user
+concern (PLANNING §2: single-user MVP); responsive/mobile polish beyond the basic two-column-to-
+stacked breakpoint in AD-25; a loading skeleton beyond a plain "Loading…" state for the first
+`/history` call; persisting `selectedSeriesId` across a reload (e.g. URL query param) — not
+required by the 5 points this slice was scoped against, easy to add later if desired.
+
+**Empirical verification (done against the real running stack, not asserted from code review):**
+with `docker compose` already up (`backend`/`redpanda`/`timescaledb`/`consumer` healthy, both NAB
+series already ingested from an earlier producer replay) and the frontend image rebuilt to bake in
+the new `recharts` dependency, the dashboard was opened in a real Chrome tab
+(`http://localhost:3000`) via `claude-in-chrome` — not just checked for a console-error-free load:
+
+- **Chart correctness, point-for-point**: hovered a red (anomaly) marker inside `ec2`'s shaded
+  ground-truth band; the tooltip read "4/15/2014, 11:09:00 PM · value: 98.29 · Anomaly detected".
+  Cross-checked directly against a fresh `curl` of the same `/history` endpoint: no `ec2` row on
+  2014-04-15 has that value, but `{"time": "2014-04-16T03:09:00+00:00", "value": 98.292,
+  "is_anomaly": true}` matches exactly — the apparent mismatch was the browser rendering the tooltip
+  in its own local timezone (UTC-4 that day), not a data bug; value and `is_anomaly` agree bit for
+  bit with the raw API response once the timezone conversion is accounted for.
+- **Series switch (AD-25's remount-on-`key` design)**: selecting `rds_cpu_utilization_cc0c53`
+  correctly unmounted/remounted the whole chart+alerts subtree — new y-axis scale (0–28% vs. `ec2`'s
+  0–100%), **two** shaded ground-truth bands (AD-10's `rds` has 2 labeled windows, `ec2` has 1), and
+  a freshly repopulated alerts list, with no stale state bleeding over from the previous series.
+- **Reconnect + gap-fill (AD-27)**: `docker compose restart backend` (a real, momentary outage) was
+  triggered while the dashboard was connected. Captured network traffic showed exactly the designed
+  sequence: a `GET /history?start=<last known point's own timestamp>&...` first returned `503`
+  (backend still restarting) — caught, surfaced as an internal error state, backoff scheduled — then
+  the identical request retried and returned `200`, after which the WebSocket reconnected and the
+  connection badge returned to "Live". No console errors during the outage/recovery window.
+- **`model_loaded: false` (AD-24/AD-29), triggered for real**: `models/isolation_forest.joblib` was
+  moved out of the way and `backend` restarted (mirroring Slice 4's own AD-24 verification, now
+  checked from the frontend's side). The banner appeared ("No trained model detected…"), the alerts
+  panel switched to its stated-empty-state message instead of silently showing nothing, and a new
+  live point that arrived during the outage rendered as the hollow "no model available" marker —
+  while every already-rendered point kept its earlier `true`/`false` color, since neither the
+  frontend nor the backend retroactively rescores already-broadcast data. Restoring the model file
+  and restarting `backend` again flipped the banner off and the alerts list back to live detections
+  within one WS message, with no page reload — confirming AD-29's reactive (not one-time) read of
+  `model_loaded`.
+- **3-state marker rendering**: zoomed on `ec2`'s leading edge and confirmed the hollow "no model
+  available" marker renders for the pre-full-window rows AD-15 drops from `compute_features`
+  (`is_anomaly: null` even though `model_loaded: true` for that request) — the one case where a
+  loaded model still legitimately produces a null point, and the chart didn't collapse it into
+  either colored state.
+
+All of the above were restored to their original state afterward (`models/isolation_forest.joblib`
+moved back, `backend` restarted once more, confirmed healthy and scoring again) before this section
+was written.
+
 ## 5. Testing Strategy
 
 _(to define per slice — QE-senior posture: not just happy-path unit tests; realistic edge cases
