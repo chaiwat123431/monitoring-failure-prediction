@@ -511,6 +511,195 @@ retraining/versioning policy beyond a single `isolation_forest.joblib`; any feat
 AD-15 (e.g. day-of-week/hour-of-day seasonality) — not justified without first seeing whether the
 4 measured metrics need it.
 
+### Slice 4 — API (status: DONE)
+
+Scope guard: this slice exposes the existing pipeline over HTTP — REST (history, model metadata) +
+one WebSocket broadcasting live scored metrics. No frontend/dashboard (Slice 5) and no change to
+the ingestion `producer`/`consumer` services (Slice 2, DONE) — they keep writing raw rows to
+TimescaleDB exactly as before, untouched by this slice.
+
+#### AD-20. REST endpoints: 3 routes, all under `/api`
+
+| Route | Purpose |
+|---|---|
+| `GET /api/series` | List the configured series (`series_id` only, from `app.ingestion.series_registry.SERIES` — the same registry the producer/train.py already use, not a second hardcoded list). Lets a client discover what exists without hardcoding series IDs. |
+| `GET /api/series/{series_id}/history?start=<iso8601>&end=<iso8601>` | Raw `raw_metrics` rows for that series in `[start, end]`, each with `time`, `value`, and `is_anomaly` (computed the same way as live scoring, AD-21 — never a stored column, consistent with AD-11's "labels are never merged onto the raw row" principle applying equally to model output). Response envelope also carries `model_loaded: bool` (top-level, once) and a `labeled_windows: [...]` array — the `nab_anomaly_windows` rows overlapping `[start, end]` for this series, via the same range-join `train.py` already does — so a chart can distinguish "NAB ground truth" from "model prediction" without a second endpoint. `start`/`end` are both **required**, no default range: the dataset is 2 fixed 14-day series (AD-10), so there's no "give me everything" use case worth guessing a default for, and an explicit range keeps the query trivially boundable without needing a row-limit/pagination scheme this project's data volume doesn't justify. |
+| `GET /api/model` | The loaded model's metadata dict, verbatim (`feature_version`, `window_minutes`, `feature_names`, `trained_at`, `series_used`, `split_cutoffs`, `model_params`, `sklearn_version`, `metrics` — exactly AD-19's schema, not a re-shaped subset). `200` if a model is loaded, `503 {"status": "not_trained", "detail": "..."}` if not (AD-24). |
+
+- **Why this 3-way split and not one combined "everything" endpoint**: `/series` is discovery,
+  `/series/{id}/history` is the (potentially large-ish, range-bound) time-series payload, `/model`
+  is a small static-ish blob unrelated to any specific range — three different cache/consumption
+  patterns for a future frontend, so they're three routes rather than one endpoint with optional
+  query params silently changing its response shape.
+- **Rejected**: (a) *per-series model metadata endpoint* (`/api/series/{id}/model`) — AD-18 already
+  decided one unified model, not one per series; a per-series URL would imply a distinction that
+  doesn't exist. (b) *embedding `labeled_windows` as a per-row column on history* — exactly the leak
+  vector AD-11 designed the separate table to avoid; keeping it a separate array in the response
+  preserves that same discipline at the API boundary.
+
+#### AD-21. Inference integration: `app.ml.features.compute_features` is imported, never re-implemented, against a model loaded once at startup
+
+- **The model is loaded exactly once**, in `main.py`'s `lifespan`, via a small
+  `app.ml.model_store.load_model(path) -> tuple[IsolationForest | None, dict | None]` (isolates the
+  `joblib.load` + missing-file handling in one place, reused by both the app and by tests). The
+  result is stored on `app.state.model` / `app.state.model_metadata` — plain attribute reads from
+  request handlers and the live-feed task (AD-22), not a per-request reload. `IsolationForest` is
+  stateless at predict time and the artifact never changes while the process runs (no hot-reload
+  endpoint in this slice's scope — retraining/versioning was already deferred in AD-19), so a single
+  shared in-memory reference is correct and requires no locking: FastAPI's default event loop is
+  single-threaded, and nothing ever mutates `app.state.model` after startup.
+- **Both the REST history endpoint (AD-20) and the WebSocket live path (AD-22) call the *same*
+  `compute_features(df) -> DataFrame` from `app/ml/features.py`** — confirmed by construction: there
+  is exactly one feature-computation function in the codebase (Slice 3's AD-15 reserved this file
+  precisely so Slice 4 would import it, not rewrite it), and both call sites pass it a small
+  `(series_id, time, value)` DataFrame and read `FEATURE_NAMES` off the result before calling
+  `model.predict(...)`. No inference code anywhere reimplements rolling mean/std/rate-of-change.
+- **Rejected**: *loading the model inside each request handler* — reopening/deserializing the
+  joblib file per request is pure waste for an artifact that never changes at runtime, and would
+  make "is the model loaded" a per-request race instead of a single startup fact.
+- **`model.predict()`/`decision_function()` are synchronous, CPU-bound scikit-learn calls — measured
+  directly against the real `models/isolation_forest.joblib` (100 estimators) before deciding
+  anything**: **~2.2 ms** for a single feature row (the shape the live-feed task calls with, AD-22)
+  and **~8.4 ms** for a 4,032-row batch (a full series, the shape `/api/series/{id}/history` calls
+  with, AD-20) — averaged over hundreds of warm runs. Both are non-negligible on a single-threaded
+  `asyncio` event loop: calling either directly would block that loop for the duration, delaying
+  every other connected WebSocket and even `/health` for that window. Under `REPLAY_SPEED=0` (the
+  mode already used for empirical verification, per AD-12/Slice 2) messages arrive back-to-back, so
+  the live-feed task would otherwise issue single-row `predict()` calls in a tight sequence with no
+  room for the loop to service anything else in between. **Both call sites therefore run the
+  scikit-learn call via `asyncio.to_thread(model.predict, X)`** (a plain daemon thread pool, no new
+  dependency — `asyncio.to_thread` is stdlib), so the event loop stays free to accept/serve other
+  connections while inference runs. This adds a small `run_in_executor` scheduling overhead per call,
+  which is accepted: it is orders of magnitude cheaper than the blocking it avoids.
+- **Rejected**: (a) *calling `model.predict()` directly on the event loop* — the measurement above is
+  the direct reason not to; single-threaded correctness (no lock needed, per the point above) doesn't
+  mean single-threaded *cheap*. (b) *a separate process/worker pool for inference* — the measured
+  costs (single-digit milliseconds) don't justify inter-process serialization overhead; a thread is
+  enough since the GIL is released during scikit-learn's native (Cython/numpy) inner loop.
+
+#### AD-22: Live path: the API runs its own second, ephemeral Kafka consumer — it does not go through the ingestion `consumer` service
+
+- **A background `asyncio` task, started in `lifespan`, subscribes directly to the `raw-metrics`
+  topic** (the same topic Slice 2's producer/consumer already use) — it is a **second, independent
+  reader of the same topic**, not a relay chained after the ingestion `consumer` service. The two
+  have entirely different jobs and failure domains: the ingestion `consumer` (AD-13/AD-14, unchanged)
+  durably upserts every row into TimescaleDB with commit-after-write and infinite retry; this new
+  live-feed task only exists to push already-durable data to whoever's watching right now, so it can
+  be lossy/best-effort without any risk to the source of truth.
+- **The live-feed task uses no consumer group and no committed offsets** (`assign()` to the topic's
+  partitions directly, `auto_offset_reset` effectively "latest"/tip-of-topic at task start, never
+  `commit()`). Justification: this consumer's state (the rolling per-series buffers, below) is
+  rebuilt from TimescaleDB on every startup anyway, so replaying old Kafka messages after a restart
+  would only mean re-broadcasting stale data as if it were live — actively wrong for a "live" feed.
+  Using a real consumer group here would also risk rebalancing against the *ingestion* consumer's
+  group if the group ID were ever reused by mistake; a groupless assign structurally can't collide.
+- **Per-series rolling buffer, seeded from TimescaleDB at startup**: `compute_features` needs ~60
+  minutes of trailing history (AD-15) to produce a non-degraded feature row for the *first* live
+  point — without seeding, the first several live points after any API restart would silently score
+  against an incomplete window. So at startup, for each `series_id` in the registry, the task queries
+  `raw_metrics` for the last `WINDOW_MINUTES` (imported from `app.ml.features`, not a second hardcoded
+  60) and keeps that as an in-memory deque; each new Kafka message appends to its series' deque and
+  evicts entries older than the window. Each new point is scored by calling `compute_features` on
+  that small buffer and reading the **last** row's features — the same function, called on a bounded
+  slice, not a hand-rolled incremental version of the rolling stats.
+- **Fan-out**: a small in-memory `ConnectionManager` (`app/live/broadcaster.py`) keyed by
+  `series_id -> set[WebSocket]`. The live-feed task, after scoring a point, looks up that series'
+  connected sockets and sends `{"series_id", "timestamp", "value", "is_anomaly", "model_loaded"}` to
+  each; a send failure removes that socket (treated the same as an explicit disconnect, AD-23).
+  This is the "internal channel" AD-9 (Slice 1) flagged as an open question (Postgres
+  `LISTEN/NOTIFY` vs. Redis vs. something else) — resolved here as: **no new channel at all**, Kafka
+  itself is the internal channel, since both the durable path and the live path already read from it
+  natively.
+- **Rejected**: (a) *the live-feed task consuming from the ingestion `consumer` service somehow
+  (e.g. it calls into the API)* — would couple two independently-scoped compose services and add a
+  network hop for no benefit, since both can read the same Kafka topic directly. (b) *reading
+  `raw_metrics` via `LISTEN/NOTIFY` triggers instead of Kafka* — would require adding a trigger to a
+  table Slice 2 deliberately kept simple (AD-14 rejected Alembic/schema churn), and duplicates
+  information already flowing through Kafka. (c) *polling TimescaleDB from the API on an interval*
+  — adds latency proportional to the poll period and DB load proportional to connected clients for a
+  feed that Kafka already pushes.
+
+#### AD-23. WebSocket: `GET /ws/series/{series_id}/live`, per-series, no automatic history backfill on connect
+
+- **One endpoint per series** (`series_id` in the path), not one global multiplexed socket carrying
+  both series — mirrors AD-20's per-series history route, and means the server never has to filter
+  a shared stream on the client's behalf; a client that wants both series opens two connections
+  (trivial at this project's 2-series scale).
+- **Connect**: validate `series_id` against the registry (`404` on close code / rejection if
+  unknown, mirroring the REST 404 a client would get from an unknown series on `/history`),
+  `accept()`, register the socket in `ConnectionManager` under that `series_id`.
+- **Disconnect/reconnect**: on `WebSocketDisconnect` (client closes) or any send exception (broken
+  pipe, timeout), the handler removes the socket from `ConnectionManager` and exits cleanly — no
+  process-wide state depends on any single connection. A client that reconnects (browser tab
+  refresh, network blip) is just a new `connect()`; nothing server-side needs to recognize it as
+  "the same" client, since the server holds no per-client session state (single-user MVP, PLANNING
+  §2).
+- **A newly-connected client does *not* receive a replay of recent history over the socket** — it
+  only receives points scored *after* it connected. **Why**: the REST history endpoint (AD-20)
+  already answers "what happened before now" for an arbitrary range chosen by the client; teaching
+  the WebSocket handler to *also* do a bounded backfill would duplicate that query logic in a second
+  place and hardcode a "how much" decision (last N minutes? last N points?) that belongs to whoever
+  is building the chart (Slice 5), not to this transport layer. The documented contract for Slice 5
+  is: call `/api/series/{id}/history` for the initial chart range, then open the WebSocket for the
+  live tail — one read path per concern, and it costs the frontend exactly one extra `fetch()` on
+  mount.
+- **Rejected**: *auto-backfill last N minutes on WS connect* — duplicates AD-20's query, and bakes a
+  frontend-shaped decision (how much history a chart wants) into the transport layer instead of
+  leaving it to the caller who actually knows.
+
+#### AD-24. Robustness: `models/isolation_forest.joblib` missing at API startup is a handled state, not a crash
+
+- **`app.ml.model_store.load_model()` catches `FileNotFoundError` explicitly** (the file legitimately
+  doesn't exist yet if `scripts/train.py` hasn't been run — a normal state for a fresh checkout, not
+  a corrupt-artifact error, which would instead surface as an unhandled `joblib`/pickle exception and
+  is *not* swallowed the same way). On a missing file: `lifespan` logs one clear line
+  (`"api: no model found at <path>, starting without inference — run scripts/train.py"`), sets
+  `app.state.model = None` / `app.state.model_metadata = None`, and startup continues — `backend`
+  must still reach the compose healthcheck (`GET /health`, which per AD-6 does no I/O and can't be
+  affected by this anyway) and `/health/ready` (checks only DB/Kafka, unaffected by model state).
+- **Every consumer of the model handles `None` explicitly, never by exception**:
+  - `GET /api/model` → `503 {"status": "not_trained", "detail": "run scripts/train.py to produce models/isolation_forest.joblib"}`.
+  - `GET /api/series/{id}/history` → still returns raw values + `labeled_windows` (neither needs the
+    model); response envelope sets `"model_loaded": false` and every row's `is_anomaly` is `null`
+    (never silently `false` — `false` would mean "the model checked and said normal", `null` means
+    "no model was available to check," a real distinction a chart should render differently, e.g.
+    greyed out vs. green).
+  - The AD-22 live-feed task still runs and still broadcasts `{series_id, timestamp, value,
+    "is_anomaly": null, "model_loaded": false}` — the live metric feed itself doesn't depend on
+    scoring being available, only the anomaly flag does.
+- **This must be demonstrated, not just coded**: verification (below) includes starting the stack
+  with `models/isolation_forest.joblib` renamed out of the way and confirming `backend` still
+  reaches healthy, `/api/model` returns `503` cleanly, and the WebSocket still streams
+  `is_anomaly: null` points — then restoring the file and confirming a fresh `backend` restart picks
+  it up and starts scoring.
+- **Rejected**: (a) *raising at startup / failing the healthcheck if the model is missing* — would
+  make `docker compose up` order-dependent on `train.py` having been run first, which is exactly the
+  kind of foot-gun AD-6 already reasoned about for DB/Kafka; a missing *model* is even more clearly
+  not a liveness problem. (b) *falling back to some naive scoring rule when the model is absent* —
+  would silently produce fabricated anomaly flags a viewer can't distinguish from real model output;
+  `null` is honest, a fake rule isn't.
+
+**Empirical verification (done, per the task — real stack, not asserted from code review):** with a
+freshly reset compose stack (`docker compose down -v` then back up, so the topic and TimescaleDB
+started genuinely empty), a real `websockets` client connected to
+`/ws/series/realAWSCloudwatch/ec2_cpu_utilization_825cc2/live`, then a real producer replay was
+triggered. All 1,434 scored live messages received matched `model.predict()` run independently on
+the same feature rows — **0 mismatches**. The AD-24 missing-model demonstration was run for real
+(renamed `models/isolation_forest.joblib` out of the way, restarted `backend`, confirmed `/health`
+stayed 200, `/api/model` returned 503 `not_trained`, `/history` returned `is_anomaly: null` +
+`model_loaded: false`, and the WebSocket kept streaming `is_anomaly: null` points; then restored the
+file and confirmed a restart picked it back up and resumed scoring). `/api/series/{id}/history` was
+checked row-for-row against `raw_metrics` and `nab_anomaly_windows` (`tests/integration/test_api.py`,
+mirroring Slice 2's own verification bar in its testing table). This first pass also caught the two
+real bugs recorded in §7 (the groupless-consumer zero-partition race, and the `:path` routing fix
+for `series_id` values containing `/`).
+
+**Deferred (need Slice 5+ information):** any pagination/downsampling of `/history` for a longer
+future dataset; multi-client scaling of the live-feed task (currently one groupless consumer per API
+process — fine for single-user MVP, PLANNING §2; would need a real consumer group + fan-out design
+if the API were ever run with >1 replica); a model hot-reload endpoint (retraining policy already
+deferred in AD-19).
+
 ## 5. Testing Strategy
 
 _(to define per slice — QE-senior posture: not just happy-path unit tests; realistic edge cases
@@ -557,6 +746,20 @@ The bar here is not "training finished without an exception" — it's the real m
 | Every training-set row's timestamp is strictly before that series' AD-16 cutoff (zero rows from inside or after any labeled window) | integration, against real stack | **real** | direct proof of the no-leakage claim, not just code review of the split logic |
 | Real `precision_score`/`recall_score`/`f1_score` per series and combined, from `backend/scripts/train.py` run against the real TimescaleDB data | integration, against real stack | **real** | the actual deliverable the task asks to see — printed/logged, not asserted against a made-up floor before the real numbers are known |
 | Loading `models/isolation_forest.joblib` back and re-predicting the same test set reproduces the same metrics | integration | **real** | proves the saved artifact is actually what was evaluated, not a save/load mismatch (feature order, missing metadata, etc.) |
+
+### Slice 4 — API (done)
+
+The bar here is explicitly not "a WebSocket connection was established" — it's real predictions
+matching the model's own `predict()`, end to end through Kafka:
+
+| Check | Kind | Real deps or mocks? | Why |
+|---|---|---|---|
+| `/api/series/{id}/history` unknown `series_id` → 404, `start >= end` → 400 | unit | none — these branches run before any DB I/O | fast, deterministic; the happy path needs real data so it's integration-tested instead |
+| `/api/model`: 503 `{"status": "not_trained"}` when `app.state.model_metadata` is `None`, 200 with the metadata verbatim when set | unit | none — `app.state` set directly, no lifespan | pure state-branching logic, same style as `test_health.py`'s dependency-status tests |
+| `ConnectionManager.broadcast` reaches only sockets registered for that `series_id`; a failed send disconnects that socket without affecting others | unit | fakes (`FakeWebSocket`) | the actual fan-out/failure-isolation logic AD-22 depends on, deterministic without a real socket |
+| WebSocket rejects an unknown `series_id` with close code 1008 before ever registering it; a known `series_id` is registered on connect and deregistered on disconnect (no leaked reference) | unit | none / real `ConnectionManager` | direct proof of AD-23's connect/disconnect contract |
+| `/api/series/{id}/history` row-for-row against `raw_metrics`, `labeled_windows` matches `nab_anomaly_windows` for the range, `is_anomaly` matches `model.predict()` computed independently on the same rows, `/api/model` matches the real joblib metadata verbatim | integration, against real stack | **real** | direct proof of AD-20/AD-21's claims, not code review |
+| **Empirical, end-to-end**: a real `websockets` client connects to `/ws/series/{id}/live`, a real producer replay is triggered, and every received `is_anomaly` is diffed against `model.predict()` run independently on the same feature rows | manual verification script against the real stack (not a permanent pytest test — needs a running WebSocket server + live replay) | **real** | the task's own bar: prove the client sees real model predictions, not just that JSON arrives — see the AD-22 bug this caught, below |
 
 ## 6. Measurements Log
 
@@ -725,3 +928,146 @@ _(transparency on what didn't work is part of the discipline — filled in as th
 - **Minor: `compute_features` re-sorted each per-series group by time after already sorting the
   whole frame by `(series_id, time)` up front** — confirmed the second sort was a genuine no-op
   (`group['time'].is_monotonic_increasing` was already `True` for every group) and removed it.
+
+### Slice 4 — API
+
+- **The live-feed task's groupless partition assignment (AD-22) was a one-shot lookup — on a fresh
+  stack it permanently locked onto zero partitions and silently never received anything, ever.**
+  Caught only by running the actual empirical verification the task calls for (a real `websockets`
+  client + a real producer replay against a stack reset with `docker compose down -v`), not by
+  reading the code: `backend` only depends on `redpanda`/`timescaledb` being healthy
+  (`docker-compose.yml`), not on the producer having run, so on a genuinely fresh stack the
+  `raw-metrics` topic doesn't exist yet when the live-feed task starts. The original
+  `_assign_at_tip()` called `partitions_for_topic()` exactly once, got an empty result, called
+  `consumer.assign([])`, and never looked again — even after the producer created the topic and
+  published thousands of messages seconds later, the task stayed assigned to nothing and the
+  WebSocket client received **zero** messages, with no error anywhere (the task just idled cleanly
+  inside `async for msg in consumer`, which yields nothing forever on an empty assignment). Fixed
+  by retrying `partitions_for_topic()` with exponential backoff until it returns a non-empty result,
+  mirroring AD-13's "block and retry, don't give up" stance. Re-ran the identical reset-and-verify
+  sequence after the fix: the live-feed task correctly received all 4,032 rows for `ec2` and all
+  isolation-forest `is_anomaly` flags matched `model.predict()` run independently on the same rows
+  — 0 mismatches (see the Measurements/Testing entry above).
+- **A second empirical run (immediately after the first, without resetting the stack) produced 510
+  mismatches between the live feed and independently-recomputed predictions — investigated before
+  concluding anything was actually broken.** The second run re-invoked the producer a second time
+  while the API's per-series rolling buffer (AD-22) was already warm with data from near the *end*
+  of the first replay (the last ~2 hours of the 14-day series); the second replay's messages start
+  again from the *beginning* of the series (2014-04-10), i.e. chronologically *before* what was
+  already sitting in the buffer. The buffer's eviction logic assumes each newly-appended point is
+  the newest, which is false in that specific sequence, corrupting the buffer's effective time
+  window for those points. **This is not a bug in the intended usage** (the producer is a one-shot
+  replay job, `restart: "no"`, meant to run exactly once per demo) — it's an artifact of re-running
+  it a second time mid-session purely to generate fresh Kafka messages for testing. Confirmed by
+  repeating the *first* scenario (fresh stack, single producer run) cleanly: 0 mismatches. Not
+  fixed — handling arbitrary backward time jumps in the live buffer is out of this slice's scope
+  (AD-12 already treats the producer as a single chronological replay); documented here instead so
+  a future slice doesn't rediscover this by surprise if the demo/deployment strategy (Slice 6) ever
+  involves re-running the producer against a live API.
+- **Path routing: `series_id` values contain a literal `/`** (e.g.
+  `realAWSCloudwatch/ec2_cpu_utilization_825cc2`, per AD-10's naming) **— FastAPI's default
+  `{series_id}` path parameter stops at the first `/`,** so `/api/series/{series_id}/history` and
+  `/ws/series/{series_id}/live` both 404'd immediately when first tested against a real series ID
+  (caught by the very first `curl` against the running stack, before writing any permanent test).
+  Fixed by using the `:path` path converter (`{series_id:path}`) on both routes, which greedily
+  matches everything up to the required literal suffix (`/history` or `/live`). Confirmed against
+  the real stack afterward: both routes resolve correctly for both series IDs.
+- **`/code-review high` on PR #4 found a real `docker-compose.yml` startup race this slice
+  introduced: `backend` depended on `redpanda`/`timescaledb` being healthy, but not on `migrate`
+  having *finished* creating `raw_metrics`/`nab_anomaly_windows`** — a gap that didn't matter before
+  Slice 4 (nothing at backend startup touched the DB) but does now that the live-feed task's buffer
+  seeding queries `raw_metrics` at startup. Reproduced directly, twice: (1) a normal
+  `docker compose up` from empty volumes showed `migrate` finishing only ~1.1s before backend's
+  first DB query — close enough to be a real, not theoretical, race; (2) the worst case, starting
+  `backend` with `migrate` never having run at all, made the live-feed task die with an uncaught
+  `UndefinedTable` from `_seed_buffer` — silently: no log line, `/health` stayed `200`, and a
+  WebSocket client kept getting accepted connections that received **zero** messages for the rest of
+  the container's life, confirmed to never recover even after running `migrate` and a full producer
+  replay afterward against that same already-started backend. Fixed two ways: (a) added
+  `migrate: condition: service_completed_successfully` to `backend`'s `depends_on`
+  (`docker-compose.yml`), matching `producer`/`consumer`'s existing convention, which removes the
+  race in normal usage; (b) defense in depth regardless — buffer seeding
+  (`feed_consumer._seed_all_buffers`) now retries with exponential backoff on `psycopg.Error`
+  instead of raising once, mirroring AD-13's ingestion-consumer stance and AD-22's own
+  topic-not-ready retry. Re-ran the exact worst-case reproduction (`backend` started with `migrate`
+  never run) after the fix: the task now logs visible retry lines instead of dying, and once
+  `migrate` + a producer replay ran afterward, that same long-running backend process picked up and
+  started streaming real scored predictions on its own — confirmed with a real WebSocket client.
+- **Same review pass: `ConnectionManager.broadcast()`'s bare `except Exception` around
+  `send_json()` would silently misclassify a real bug as a dead client.** `send_json()` calls
+  `json.dumps()` *before* touching the socket (confirmed by reading Starlette's source directly,
+  not assumed) — a non-serializable value in the broadcast message raises `TypeError` there, before
+  any connection-related failure is even possible, while an actually-broken connection surfaces as
+  `WebSocketDisconnect` or `RuntimeError` (also confirmed from Starlette's `WebSocket.send()`
+  source). The bare `except Exception` treated both identically: silently disconnect the client and
+  drop the message, with no way to tell "client went away" from "we sent it garbage." Not
+  triggered by any data this slice currently sends, so this was a latent gap rather than a live
+  failure — fixed anyway by narrowing the `except` to `(WebSocketDisconnect, RuntimeError)`, so a
+  future serialization bug propagates loudly instead of vanishing. Added
+  `backend/tests/unit/test_broadcaster.py` cases proving a `TypeError` now propagates (socket stays
+  registered) while a `WebSocketDisconnect`/`RuntimeError` is still treated as gone. Also added a
+  broad `try/except` around each message's scoring+broadcast in `run_live_feed`'s main loop, so one
+  bad message still can't take the whole live-feed task down for every connected client.
+- **Same review pass: a `start`/`end` query param on `/api/series/{id}/history` with no UTC offset
+  crashed with a `500`.** FastAPI/pydantic parses `"2014-04-15T00:00:00"` (no trailing `Z`/offset)
+  as a *naive* `datetime`, while every `time` value read back from TimescaleDB (`TIMESTAMPTZ`) is
+  tz-aware — reproduced directly against the running server (a plain `500 Internal Server Error`)
+  before touching any code. Fixed by normalizing a naive `start`/`end` to UTC right after parsing
+  (AD-12's own convention: this project's timestamps are UTC when no zone is given), rather than
+  erroring or guessing the caller's local zone. Added a regression test
+  (`test_history_accepts_naive_start_end_as_utc`) to `tests/integration/test_api.py`.
+- **Same review pass, acknowledged but not fixed: `/api/series/{id}/history` opens a new
+  `psycopg` connection per request instead of using a pool.** Real observation, not disputed — but
+  at this project's actual scale (single-user MVP, PLANNING §2; 2 series; no measured concurrent
+  load) it isn't a live problem, and adding pooling (a new dependency, `psycopg_pool`, plus lifespan
+  wiring) for a cost that hasn't been measured would be exactly the premature optimization this
+  project's own conventions argue against elsewhere (e.g. Slice 2 AD-13's rejected batching, decided
+  the same way: measure first, don't add complexity for a bottleneck that isn't there yet). Deferred
+  to Slice 5+ if a real dashboard's polling pattern ever measurably needs it — same treatment as
+  `_SERIES_IDS`'s dedup below, both filed rather than silently dropped.
+- **Same review pass: `_SERIES_IDS` (the "is this a known series_id" set) was defined identically
+  in both `app/api/metrics.py` and `app/api/ws.py`.** No behavioral bug today, but the two copies
+  could silently diverge under a future edit. Moved to a single `SERIES_IDS` constant in
+  `app/ingestion/series_registry.py` (the module that already owns `SERIES`) and imported by both.
+
+**Second `/code-review high` pass, after the fixes above, per the task ("relance le code-review pour
+vérifier que les fixes tiennent") — found 3 more real issues in the same file, plus a repeat of the
+already-deferred connection-pooling note:**
+
+- **The live-feed loop accepted *any* `series_id` from the Kafka topic — unlike `/history` and the
+  WebSocket endpoint, which both validate against `SERIES_IDS` before doing anything.** Confirmed
+  directly: published a message with a bogus `series_id` straight to the topic (bypassing the
+  producer entirely) and it was silently accepted into `buffers` with zero trace anywhere. A stray
+  or malformed producer message would have grown `buffers` with a junk entry for the rest of the
+  container's life. Fixed by validating `series_id` against the same `SERIES_IDS` used by the
+  REST/WebSocket layer (§7's dedup above) and skip-and-log otherwise — re-ran the identical
+  reproduction after the fix and confirmed the message is now rejected with a visible log line.
+- **`_score_input_row` (rebuilding a small pandas DataFrame and recomputing the rolling features
+  from scratch on every incoming message) ran directly on the event loop, unlike `model.predict()`
+  right next to it, which AD-21 already measured and moved to `asyncio.to_thread()`.** Measured
+  directly on this project's real buffer size (~25 rows at NAB's cadence over `BUFFER_MINUTES`):
+  **~1.1ms** — the same order of magnitude as `model.predict()`'s own measured ~2.2ms, i.e. the exact
+  "non-negligible, don't block the loop" threshold AD-21 already established, just left unapplied to
+  this one call site. Fixed by running it through `asyncio.to_thread()` too, for the same reason.
+- **The main `async for msg in consumer:` loop had no exception handling of its own — only
+  per-message processing did.** If the underlying Kafka fetch ever raised instead of retrying
+  internally, the whole live-feed task would die silently, exactly like the buffer-seeding and
+  topic-assignment races already fixed earlier in this same file. **Tried hard to reproduce and
+  could not**: a `docker compose restart redpanda` and a full 40-second `docker compose stop
+  redpanda` (well beyond a normal healthcheck cycle) both recovered on their own via aiokafka's
+  internal reconnect logic — confirmed with a real WebSocket client receiving live, correctly-scored
+  messages again after each outage, with no task restart needed. Fixed anyway, as defense in depth:
+  extracted the consumer lifecycle into `_consume_forever()` and wrapped it in an outer
+  retry-with-backoff loop in `run_live_feed()`, consistent with the retry-don't-die pattern already
+  applied twice in this file. Documented as *not empirically confirmed dead*, unlike the other
+  findings in this section — applied for consistency and because aiokafka's internal retry coverage
+  isn't a documented guarantee, not because a live failure was observed.
+- **The same per-request-connection-pooling observation from the first review pass was raised again,
+  now also naming `feed_consumer.py`'s per-seed-cycle connection as a third instance of the same
+  pattern.** No new information changes the earlier call: still deferred, still not a measured
+  problem at this project's single-user MVP scale (PLANNING §2).
+
+Added `backend/tests/unit/test_feed_consumer.py` (previously nonexistent) covering the unknown-
+`series_id` skip and the outer loop's retry-after-failure behavior. Re-ran the full empirical bar
+once more after all of the above, on a stack rebuilt from these fixes: 1,518/1,518 live messages
+matched `model.predict()` independently — 0 mismatches. 55/55 backend tests pass.
