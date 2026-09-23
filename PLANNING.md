@@ -1570,3 +1570,81 @@ All fixes re-verified against the real running stack via a live Chrome session (
 build, though all three stayed clean): the fetch-failure retry and the new error banner were both
 reproduced by stopping `backend` mid-session and on a fresh page load, confirming the fix in each
 case before restarting `backend` and confirming recovery. Squash-merged to `main` after this pass.
+
+### Slice 6 — Deployment
+
+`/code-review high` on PR #6 found two severe gaps and several real correctness/simplification
+issues before any of this had a chance to fail silently on a real deploy — exactly the value of
+running it before merging, since none of these would have thrown an error or failed a healthcheck:
+
+- **The trained model artifact had no path to the deployed Machine at all.** `models/` is gitignored
+  (AD-19) — local dev gets it via a bind mount (`./models:/app/models:ro`,
+  `docker-compose.yml`), but `docker-compose.fly.yml` had no volume, no Fly Volume, and no Dockerfile
+  `COPY` putting a model file anywhere on the Machine. `load_model()` would have found nothing,
+  `app.state.model` stayed `None` forever (AD-24's own "handled state," which is exactly why this
+  wouldn't have crashed or failed a healthcheck), and the deployed demo would silently never score a
+  single anomaly. Fixed by adding a `models_data` Fly Volume (`fly.toml`) shared between two new
+  processes: `backend` (reads) and a new one-shot `train` compose service (writes, running
+  `scripts/train.py` against the real deployed TimescaleDB once ingestion has real rows) —
+  `deploy/fly/README.md` now sequences producer -> train -> restart backend. Verified for real:
+  built the `prod` backend image, ran `scripts/train.py` inside it against this project's actual
+  local TimescaleDB (mounting a throwaway directory, not the real `models/`), and got the exact same
+  precision/recall/F1 numbers already on record in this document's Slice 3 measurements log
+  (0.126/0.825/0.218 for `ec2`, 0.322/0.769/0.454 for `rds`) — bit-for-bit consistent, not just "it
+  ran without an exception."
+- **The producer's NAB CSVs had no path to the deployed Machine either.** `docker-compose.fly.yml`
+  bind-mounted `./data:/data:ro` — a path that only exists on a developer's own checkout (`data/` is
+  gitignored, AD-1), never on a remote Fly Machine. Following `deploy/fly/README.md`'s own documented
+  producer step as originally written would have crashed with `FileNotFoundError`. Fixed by baking
+  the 2 NAB CSVs into the backend `prod` image at *build* time (`backend/Dockerfile`, fetched from
+  the same NAB GitHub URLs `scripts/fetch_nab_data.sh` already uses, at the exact `/data` path the
+  producer already defaults to — no env var or compose change needed) — AD-14's "the producer
+  container itself needs no internet access" still holds at *runtime*, unchanged; only the build step
+  gained a network dependency, which is normal. Verified by building the image for real and
+  confirming both CSVs land with the correct row counts (4,032 data rows each, matching AD-10).
+- **The Caddyfile routed `/health`/`/health/ready` to the frontend, not the backend — caught by
+  actually validating the config, not by reading it.** `backend/app/api/health.py` registers both
+  routes with no `/api` prefix, so they fell through the original `/api/*`/`/ws/*`-only rules into
+  the catch-all block, which forwards to the frontend (port 3000) — meaning `deploy/fly/README.md`'s
+  own post-deploy `curl .../health` check would have hit a Next.js 404, not the backend. Fixed by
+  adding a named `path` matcher covering `/api/*`, `/ws/*`, and `/health*` together. **A second,
+  real bug was caught fixing the first one**: the initial fix used `handle /api/* /ws/* /health* {
+  ... }`, assuming (wrongly) that `handle` takes multiple path arguments the way some other Caddy
+  directives do — running `caddy validate` against the actual Caddyfile (not just reading Caddy's
+  docs) failed immediately with a parse error, before this ever reached a real deploy. `handle` takes
+  exactly one argument; a named `path` matcher (which *does* accept several patterns) referenced by
+  `handle @name` is the correct shape, confirmed valid by the same `caddy validate` run. Further
+  confirmed with a real routing test: ran the built backend `prod` image and a Caddy container
+  sharing its network namespace (`docker run --network container:<backend>`, deliberately mirroring
+  how Fly's compose Machine shares one namespace across containers, AD-31) and hit Caddy's `:8080`
+  from outside — `/health` and `/api/series` both correctly reached the backend.
+- **`caddy`'s `depends_on` used plain service names instead of `condition: service_healthy`**, unlike
+  every other service in the same file. Since backend's own startup chain and frontend's healthcheck
+  both take real time, Caddy (the one public entry point) could start accepting traffic before either
+  was actually ready, turning the README's own immediate post-deploy verification into a race against
+  502s. Fixed to match the file's own established pattern.
+- **The `${POSTGRES_PASSWORD}`/`${FLY_APP_NAME}`/`${IMAGE_REGISTRY}` substitutions were documented as
+  coming from `fly secrets set` — which is not how Compose variable substitution works.** `${VAR}` in
+  a compose file is resolved by whatever process *parses that file* (locally, when `fly deploy` reads
+  it), not by anything injected into a container's runtime environment — `fly secrets` and compose
+  substitution are two unrelated mechanisms that happened to look interchangeable in the first draft.
+  This file's own header comment already flagged the substitution path as "least-verified," which
+  this confirmed was a concrete gap, not just a hedge: without exporting these in the *deploying*
+  shell, `DATABASE_URL` would silently resolve to a passwordless connection string and
+  `CORS_ALLOWED_ORIGINS` to `https://.fly.dev` (matching no real `Origin` header). Fixed by rewriting
+  `deploy/fly/README.md`'s secrets section to `export` all three in the same shell `fly deploy` runs
+  from, and correcting the compose file's own header comment to stop claiming otherwise.
+- **Minor — simplification**: `docker-compose.fly.yml` retyped `DATABASE_URL`/`KAFKA_BOOTSTRAP_SERVERS`
+  across four services instead of reusing an `x-backend-env` YAML anchor, unlike the sibling dev file
+  right next to it doing exactly that. Added the same anchor. Also hardcoded `app`/`monitoring`
+  instead of parameterizing `${POSTGRES_USER:-app}`/`${POSTGRES_DB:-monitoring}` the way the dev file
+  already does — fixed to match.
+- **Minor — the backend `prod` image shipped `tests/`** via an unqualified `COPY . .` with no
+  matching `.dockerignore` entry (only `.venv`/`__pycache__`/`.pytest_cache` were excluded). Added
+  `tests` to `backend/.dockerignore`; `scripts/` is kept, since the new `train` service (above) needs
+  `scripts/train.py` at runtime.
+
+Re-ran the full local verification pass after all of the above: both `prod` images still build
+clean, 55/55 backend tests still pass, local `docker compose up` dev workflow still fully unaffected.
+The real `fly deploy` itself remains not-yet-run (no Fly account in this environment, unchanged from
+before this review pass) — `deploy/fly/README.md` has the up-to-date command sequence.

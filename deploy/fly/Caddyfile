@@ -3,11 +3,13 @@
 # this port (fly.toml's [http_service].internal_port) — Caddy has no ACME/certificate config of its
 # own to do here, only routing.
 :8080 {
-	handle /api/* {
-		reverse_proxy localhost:8000
-	}
-
-	handle /ws/* {
+	# /code-review high fix (Slice 6 PR #6): /health and /health/ready (backend/app/api/health.py)
+	# have no /api prefix — without this, they fell through to the catch-all below and hit the
+	# frontend instead, breaking deploy/fly/README.md's own post-deploy curl checks. `handle` itself
+	# only takes one path argument, hence a named `path` matcher (which does take several) instead
+	# of one `handle` per prefix.
+	@backend path /api/* /ws/* /health*
+	handle @backend {
 		reverse_proxy localhost:8000
 	}
 

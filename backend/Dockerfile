@@ -33,7 +33,17 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen
 
 COPY . .
-RUN chown -R app:app /app
+
+# /code-review high fix (Slice 6 PR #6): the deployed Fly Machine has no host-side `./data` bind
+# mount (data/ is gitignored, AD-14) — bake the same 2 NAB CSVs scripts/fetch_nab_data.sh fetches
+# locally directly into the image, at the exact path (`/data`) the producer already defaults to, so
+# no env var or compose change is needed on top of this. This is a *build-time* fetch only — AD-14's
+# "the producer container itself needs no internet access" still holds at runtime, unchanged.
+RUN mkdir -p /data/realAWSCloudwatch && \
+    python -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/numenta/NAB/master/data/realAWSCloudwatch/ec2_cpu_utilization_825cc2.csv', '/data/realAWSCloudwatch/ec2_cpu_utilization_825cc2.csv')" && \
+    python -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/numenta/NAB/master/data/realAWSCloudwatch/rds_cpu_utilization_cc0c53.csv', '/data/realAWSCloudwatch/rds_cpu_utilization_cc0c53.csv')"
+
+RUN chown -R app:app /app /data
 USER app
 
 EXPOSE 8000

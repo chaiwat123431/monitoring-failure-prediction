@@ -23,6 +23,16 @@ compose = "docker-compose.fly.yml"
   destination = "/var/lib/postgresql/data"
   processes = ["timescaledb"]
 
+# /code-review high fix (Slice 6 PR #6): models/ (AD-19) is gitignored — this volume is how a
+# trained model artifact (deploy/fly/README.md's `train` step) survives a Machine restart and is
+# readable by `backend`. Shared by two processes — least-verified part of this file (see
+# docker-compose.fly.yml's own header comment): confirm one Fly Volume can actually be mounted by
+# both during the real first `fly deploy`.
+[[mounts]]
+  source = "models_data"
+  destination = "/app/models"
+  processes = ["backend", "train"]
+
 # AD-34: one public entry point — Caddy's port, not backend's or frontend's directly. Fly terminates
 # TLS at its edge and forwards plain HTTP here.
 [http_service]

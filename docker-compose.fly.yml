@@ -4,25 +4,40 @@
 # Differences from docker-compose.yml, and why (all per AD-31, researched against Fly's actual
 # compose-deploy constraints, not guessed):
 #   - `build:` -> `image:` for every app-owned service. Fly's compose deploy allows only one `build:`
-#     entry in the whole file; backend/migrate/producer/consumer/frontend must reference pre-built,
-#     pre-pushed images instead (see deploy/fly/README.md for the build+push step this requires
-#     before `fly deploy`).
+#     entry in the whole file; backend/migrate/producer/consumer/train/frontend must reference
+#     pre-built, pre-pushed images instead (see deploy/fly/README.md for the build+push step this
+#     requires before `fly deploy`).
 #   - Service-name DNS (`redpanda:9092`, `timescaledb:5432`) -> `localhost` addressing. A Fly compose
 #     Machine's containers share one network namespace, not compose's own per-stack bridge network.
-#   - No dev bind-mounts (`./backend/app`, `./frontend/src`) — the prod images already bake the code
-#     in; nothing to hot-reload on a public host.
+#   - No dev bind-mounts (`./backend/app`, `./frontend/src`, `./data`) — the prod backend image bakes
+#     both the code and the NAB CSVs in (backend/Dockerfile's `prod` stage); nothing to hot-reload or
+#     fetch from the host on a public Machine.
 #   - Redpanda's external listener (AD-3, for host-side tools) is dropped — nothing outside the
-#     Machine needs to reach it directly in prod; the producer/consumer run as containers on the same
-#     Machine and already use the internal listener.
-#   - A 5th service, `caddy` (AD-34): the one public entry point, path-routing to backend/frontend
+#     Machine needs to reach it directly in prod; the producer/consumer/train run as containers on
+#     the same Machine and already use the internal listener.
+#   - A new `train` one-shot service and `models_data` volume: `models/` is gitignored (AD-19) and
+#     was never reachable on a Fly Machine any other way — this runs `scripts/train.py` against the
+#     real deployed TimescaleDB, once ingestion has real rows, writing to the same volume `backend`
+#     reads from (see deploy/fly/README.md's ordering: migrate -> producer -> train -> restart
+#     backend).
+#   - A 6th service, `caddy` (AD-34): the one public entry point, path-routing to backend/frontend
 #     over the same localhost addressing everything else here uses.
 #
-# Least-verified part of this file (stated plainly, per AD-34): the exact mapping from this file's
-# top-level `volumes:` to Fly Volumes (declared separately via `fly volumes create` + fly.toml's
-# `[[mounts]]`), and whether Fly's compose engine passes `fly secrets` through as the `${VAR}`
-# substitutions used below the same way a local `.env` file does for docker-compose.yml today —
-# both assumed here by direct analogy with documented Fly/compose behavior, to be confirmed (and
-# this file corrected if reality disagrees) against the real first `fly deploy`.
+# `${POSTGRES_PASSWORD}` / `${FLY_APP_NAME}` / `${IMAGE_REGISTRY}` below are resolved by whatever
+# process parses *this file* (i.e. locally, when `fly deploy` reads it) — exactly like
+# docker-compose.yml's own `${POSTGRES_PASSWORD:-app}` is resolved from a local `.env` today, not
+# from Fly's runtime secret store (a *running container* getting a `fly secrets set` value and *this
+# YAML file* being textually substituted are two different mechanisms). deploy/fly/README.md has the
+# `export` step this requires in the same shell `fly deploy` runs from.
+#
+# Least-verified part of this file (stated plainly, per AD-34): whether Fly's compose engine maps a
+# bare `external: true` named volume to a pre-created Fly Volume of the same name the way assumed
+# below, and whether one Fly Volume can be mounted by two processes at once (`models_data`, shared
+# by `backend` and `train`) — both to be confirmed against the real first `fly deploy`.
+
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD}@localhost:5432/${POSTGRES_DB:-monitoring}
+  KAFKA_BOOTSTRAP_SERVERS: localhost:9092
 
 services:
   redpanda:
@@ -47,13 +62,13 @@ services:
   timescaledb:
     image: timescale/timescaledb:2.30.1-pg17
     environment:
-      POSTGRES_USER: app
+      POSTGRES_USER: ${POSTGRES_USER:-app}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: monitoring
+      POSTGRES_DB: ${POSTGRES_DB:-monitoring}
     volumes:
       - timescaledb_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d monitoring"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-monitoring}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -62,10 +77,11 @@ services:
   backend:
     image: ${IMAGE_REGISTRY}/mfp-backend:prod
     environment:
-      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
-      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      <<: *backend-env
       MODEL_PATH: /app/models/isolation_forest.joblib
       CORS_ALLOWED_ORIGINS: https://${FLY_APP_NAME}.fly.dev
+    volumes:
+      - models_data:/app/models
     depends_on:
       redpanda:
         condition: service_healthy
@@ -84,8 +100,7 @@ services:
     image: ${IMAGE_REGISTRY}/mfp-backend:prod
     command: ["python", "-m", "app.ingestion.migrate"]
     environment:
-      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
-      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      <<: *backend-env
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -99,12 +114,8 @@ services:
     image: ${IMAGE_REGISTRY}/mfp-backend:prod
     command: ["python", "-m", "app.ingestion.producer"]
     environment:
-      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
-      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
-      NAB_DATA_DIR: /data
+      <<: *backend-env
       REPLAY_SPEED: "3600"
-    volumes:
-      - ./data:/data:ro
     depends_on:
       redpanda:
         condition: service_healthy
@@ -116,8 +127,7 @@ services:
     image: ${IMAGE_REGISTRY}/mfp-backend:prod
     command: ["python", "-m", "app.ingestion.consumer"]
     environment:
-      DATABASE_URL: postgresql://app:${POSTGRES_PASSWORD}@localhost:5432/monitoring
-      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      <<: *backend-env
     depends_on:
       redpanda:
         condition: service_healthy
@@ -126,6 +136,24 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+
+  # /code-review high fix (Slice 6 PR #6): models/ (AD-19) is gitignored and was never reachable on
+  # a Fly Machine any other way (no bind mount, no volume, no image COPY). Run once the producer has
+  # replayed and the consumer has ingested real rows; writes to the same models_data volume `backend`
+  # reads from — restart `backend` afterward so it picks the model up (AD-24's own documented
+  # recovery path, unchanged).
+  train:
+    image: ${IMAGE_REGISTRY}/mfp-backend:prod
+    command: ["python", "scripts/train.py"]
+    environment:
+      <<: *backend-env
+      MODEL_PATH: /app/models/isolation_forest.joblib
+    volumes:
+      - models_data:/app/models
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: "no"
 
   frontend:
     # NEXT_PUBLIC_API_URL is not set here: it's baked into this image at `docker build` time
@@ -148,9 +176,15 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - backend
-      - frontend
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
 
 volumes:
   redpanda_data:
+    external: true
   timescaledb_data:
+    external: true
+  models_data:
+    external: true
