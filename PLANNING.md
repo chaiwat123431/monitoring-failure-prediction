@@ -368,7 +368,7 @@ splits; ingesting further NAB series beyond the 2 above; space-partitioning `raw
 migration; consumer running anywhere other than a single compose service (no horizontal scaling
 yet — not needed at this volume).
 
-### Slice 3 — Model (status: PROPOSED, awaiting validation — no code written yet)
+### Slice 3 — Model (status: DONE)
 
 Scope guard: feature engineering + training + evaluation of one Isolation Forest model. No FastAPI
 endpoint, no WebSocket, no dashboard — those are Slices 4 and 5. Numbers below are measured
@@ -546,7 +546,7 @@ diff:
 | TimescaleDB stopped mid-replay: consumer blocks (doesn't crash, doesn't lose its offset), resumes and catches up once the DB is back | integration / compose | **real** | direct test of AD-13's retry-and-stall claim |
 | Producer emits messages keyed by `series_id` with the CSV's own timestamp in the payload (not `now()`) | unit | none — inspect produced messages directly | fast, deterministic check that the two-clocks separation in AD-12 wasn't accidentally collapsed |
 
-### Slice 3 — Model (proposed)
+### Slice 3 — Model (done)
 
 The bar here is not "training finished without an exception" — it's the real measured precision/recall/F1 against the known windows:
 
@@ -562,6 +562,27 @@ The bar here is not "training finished without an exception" — it's the real m
 
 _(real measured numbers only, no unverified estimates — latency, throughput, model
 precision/recall, etc., filled in as the project progresses)_
+
+### Slice 3 — Model
+
+One `IsolationForest` (`n_estimators=100`, `contamination="auto"`, `random_state=42`), evaluated
+point-wise against `nab_anomaly_windows`. Measured with `backend/scripts/train.py` against the
+real TimescaleDB data (2026-09-23), reproduced by reloading the saved
+`models/isolation_forest.joblib` and re-predicting independently (see AD-19 verification, §5):
+
+| Series | Train rows | Test rows | Test positives (in-window) | Precision | Recall | F1 |
+|---|---|---|---|---|---|---|
+| `ec2_cpu_utilization_825cc2` | 1,514 | 2,506 | 343 | 0.126 | 0.825 | 0.218 |
+| `rds_cpu_utilization_cc0c53` | 2,968 | 1,052 | 402 | 0.322 | 0.769 | 0.454 |
+| **Combined** | 4,482 | 3,558 | 745 | **0.184** | **0.795** | **0.299** |
+
+Reading these: recall is the strong side (catches ~77–83% of truly-anomalous points per series) at
+the cost of precision (a lot of false positives — expected from an untuned, unsupervised model
+whose only calibration lever is `contamination="auto"`). As AD-17 states explicitly, this is
+computed over **3 labeled windows total** — informative for this portfolio project, not a
+statistically significant validation. Not tuned further in this slice (no FastAPI/dashboard yet to
+consume a tuned threshold meaningfully) — a natural first target if Slice 4/5 surfaces false
+positives as a UX problem.
 
 ## 7. Bugs & False Starts
 
@@ -660,3 +681,17 @@ _(transparency on what didn't work is part of the discipline — filled in as th
   partial-batch-failure handling for a throughput problem that doesn't exist at this scale. Not
   applied — revisit only if the dataset size changes materially (e.g. ingesting the full NAB
   corpus, which AD-10 explicitly deferred).
+
+### Slice 3 — Model
+
+- **`pandas==2.3.3` + `numpy==2.5.3` (the versions `pandas>=2.2,<3` first resolved to) raise a
+  `DeprecationWarning` on every single `pd.Timedelta(...)` construction** — confirmed directly,
+  not assumed: `pd.Timedelta(minutes=60)` and even the plain string form `pd.Timedelta('60min')`
+  both trigger `"The 'generic' unit for NumPy timedelta is deprecated"` under `-W
+  error::DeprecationWarning` on this pandas/numpy pairing, i.e. `app/ml/features.py`'s time-based
+  rolling window (AD-15) would have logged a deprecation warning on every training run and is one
+  numpy release away from an outright break. Fixed by widening the dependency range to
+  `pandas>=2.2,<4` and locking to the resolved `pandas==3.0.6`, which does not exhibit this warning
+  (checked the same `pd.Timedelta` calls under `-W error::DeprecationWarning` again, clean). No
+  other code changes needed — `compute_features`'s pandas API surface (`.rolling()`, `.diff()`,
+  groupby) is unchanged between 2.3 and 3.0 for what this project uses.
