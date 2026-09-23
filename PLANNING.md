@@ -368,6 +368,149 @@ splits; ingesting further NAB series beyond the 2 above; space-partitioning `raw
 migration; consumer running anywhere other than a single compose service (no horizontal scaling
 yet — not needed at this volume).
 
+### Slice 3 — Model (status: PROPOSED, awaiting validation — no code written yet)
+
+Scope guard: feature engineering + training + evaluation of one Isolation Forest model. No FastAPI
+endpoint, no WebSocket, no dashboard — those are Slices 4 and 5. Numbers below are measured
+directly against the real ingested data (`SELECT min(time), max(time), count(*) ... GROUP BY
+series_id` and `SELECT * FROM nab_anomaly_windows`), not estimated.
+
+#### AD-15. Feature engineering: one 60-minute trailing window, 4 features, computed per series
+
+For each row (`series_id`, `time`, `value`), computed over the trailing window **within that
+series only** (rolling state never crosses a `series_id` boundary):
+
+| Feature | Definition | Why |
+|---|---|---|
+| `value` | the raw reading itself | the window-smoothed features below can hide a sharp deviation *at* the current instant — this keeps the instant itself visible to the model |
+| `rolling_mean_1h` | mean of `value` over the trailing 60 minutes | characterizes the recent baseline level |
+| `rolling_std_1h` | sample std (`ddof=1`) of `value` over the trailing 60 minutes | characterizes recent dispersion/volatility — a level shift *and* a volatility shift are both meaningful CPU-utilization anomaly signatures |
+| `rate_of_change` | `value[t] − value[t−1]` (previous sample in the same series) — deliberately **not** windowed | captures short-term momentum; averaging this over the same 1h window as the others would smooth out exactly the fast movement this feature exists to detect |
+
+- **Window is time-based (a real 60-minute wall-clock span via pandas' offset-based
+  `.rolling('60min')`), not row-count-based (`.rolling(12)`).** The ingested data isn't perfectly
+  uniform — checked directly: both series have occasional 10-minute gaps alongside the mostly
+  5-minute cadence (Slice 2 AD-12's own verification). A row-count window would silently span more
+  than an hour whenever a gap falls inside it; a time-based window doesn't have that failure mode
+  and costs no real extra complexity in pandas.
+- **Why 60 minutes**: both series' 5 labeled-window-days aside, every actual anomaly window is
+  16–28 hours long (the shortest, `rds` window 2, is 16h40m; the longest, `ec2`, is 28h30m). A
+  60-minute feature window reaches full contamination (i.e. every point in the window is inside
+  the anomaly) within roughly 4–6% of the anomaly's own duration — fast relative to how long the
+  anomaly actually lasts, without being so short that `rolling_std_1h` is dominated by 1–2 point
+  noise.
+- **Rejected**: (a) *15 minutes* — only 3 samples at nominal cadence; `rolling_std` over 3 points
+  is itself noisy, defeating the point of smoothing. (b) *6h or 24h* — for most of a 16–28h
+  anomaly's duration, a 6h+ window would contain a mix of anomalous and normal points, diluting
+  the very deviation the feature is meant to surface, right when it should be sharpest. (c) *also
+  windowing `rate_of_change`* — would make it redundant with `rolling_mean`'s trend rather than a
+  distinct momentum signal.
+- **Rows without a full hour of preceding history are dropped, not backfilled** (the first ~12
+  rows of each series). This is ≈0.3% of each series and, checked directly, falls entirely within
+  the pre-anomaly training portion for both series (first anomaly is 5+ days into `ec2`, 10+ days
+  into `rds`) — no evaluation data is lost to this.
+- Lives in `backend/app/ml/features.py` — the path Slice 1's AD-9 reserved specifically so this is
+  the *same code* Slice 4's live inference imports later, not a re-implementation that can drift.
+
+#### AD-16. Train/test split: temporal, cut per-series at that series' first labeled anomaly
+
+| Series | Train | Test | Train rows (post window-drop) |
+|---|---|---|---|
+| `ec2_cpu_utilization_825cc2` | `[2014-04-10 00:04, 2014-04-15 07:24)` | `[2014-04-15 07:24, 2014-04-24 00:09]` | 1,526 / 4,032 = **37.9%** |
+| `rds_cpu_utilization_cc0c53` | `[2014-02-14 14:30, 2014-02-24 22:50)` | `[2014-02-24 22:50, 2014-02-28 14:30]` | 2,980 / 4,032 = **73.9%** |
+
+(Row counts measured directly against `raw_metrics`, before the window-drop in AD-15 removes ~12
+rows per series from the front of train.)
+
+- **Cutoff = the start of that series' first labeled anomaly window** — never a shared global
+  fraction. Verified directly why a shared fraction would be wrong: `ec2`'s anomaly
+  (07:24 on day 5 → 11:54 on day 6, i.e. 37.9%–46.4% of the series) would fall entirely *inside* a
+  naive 60% (or even 50%) global split — training the "what does normal look like" baseline on the
+  one pattern the model most needs to flag as abnormal. The two series' anomalies are unrelated
+  events on unrelated calendar dates; only a per-series cutoff, placed by where each series'
+  *actual* anomaly falls, avoids this.
+- **Cutoff is placed at, not before, the anomaly start** — this maximizes real training data while
+  still guaranteeing zero anomaly contamination: the constraint is "no training row's own
+  timestamp is inside a labeled window," and a trailing (backward-looking) feature window can
+  never pull anomalous data into a training row whose own timestamp already precedes the anomaly —
+  so no extra safety buffer before the cutoff is needed.
+- **The resulting train fractions are deliberately different per series (37.9% vs. 73.9%) — this
+  is correct, not an inconsistency.** It's mechanically forced by where each series' real anomaly
+  happens to sit in its own 14-day window; forcing a uniform ratio would mean picking a wrong
+  number for one series to keep the other tidy.
+- `rds`'s test period contains **both** of its labeled windows (window 2 starts 2014-02-26 16:30,
+  after the cutoff) — confirmed directly from `nab_anomaly_windows`, not assumed.
+- **Rejected**: a fixed 80/20 (or any uniform) split ignoring where the labeled anomalies fall —
+  demonstrated above to contaminate `ec2`'s training set.
+
+#### AD-17. Evaluation: `nab_anomaly_windows` is joined only after `.fit()`, never before
+
+- **`IsolationForest.fit(X_train)` takes features only — scikit-learn's unsupervised API has no `y`
+  parameter to accept a label in the first place.** This is a stronger guarantee than "we chose
+  not to pass the label": there is no code path through which `nab_anomaly_windows` could leak into
+  training even by mistake, structurally continuing Slice 2 AD-11's separate-table design.
+  `nab_anomaly_windows` is touched exactly once in the whole pipeline — after training, to score
+  predictions.
+- **Ground truth for evaluation**: for each test-set row, `y_true = 1` if
+  `row.time BETWEEN window_start AND window_end` for that `series_id` in `nab_anomaly_windows`,
+  else `0` — computed with a join/range check, entirely after `.fit()` has already happened.
+- **Metrics are standard point-wise precision/recall/F1** (`sklearn.metrics`), comparing `y_true`
+  (from the join above) against `y_pred = 1 if IsolationForest.predict(x) == -1 else 0` for every
+  test row. **Rejected**: NAB's own official windowed/weighted scoring profiles (standard /
+  reward-low-FP / reward-low-FN) — that's a separate scoring framework built for crediting early
+  detection in a live streaming benchmark; the task asks for precision/recall/F1 directly, and
+  building NAB's scorer is out of this slice's scope.
+- **Both per-series and combined (both test sets concatenated) metrics are computed and kept** —
+  the real measured numbers, not estimated, land in the model artifact's metadata (AD-19) once
+  training actually runs.
+- **Statistical caveat, stated plainly**: these precision/recall/F1 numbers are computed over
+  exactly **3 labeled anomaly windows total** (1 for `ec2`, 2 for `rds`) — the entire ground truth
+  this slice has to evaluate against. That's genuinely useful signal for this portfolio/demo
+  project, but it is not a statistically significant validation at the scale a real production
+  system would require; a handful of windows means a single early/late/missed detection swings the
+  metrics substantially. Not a reason to skip measuring them — just a reason not to over-read them.
+
+#### AD-18. One unified model across both series, not one model per series
+
+- A single `IsolationForest` is fit on the concatenated training rows from both series (1,526 +
+  2,980 = 4,506 rows). `series_id` itself is **not** a feature — only 2 distinct values exist,
+  wouldn't generalize to a series Slice 4 sees later, and Isolation Forest partitions on numeric
+  geometry, not categorical identity.
+- **Rejected: one model per series** — (a) far less training data per model (1,526 rows alone for
+  `ec2`), (b) doesn't generalize if Slice 4 ever scores a series neither model was trained on, (c)
+  both series measure the literal same physical quantity (CPU utilization, 0–100%) on the same
+  scale, so there's no unit-mismatch forcing separation the way e.g. mixing CPU% with raw network
+  bytes would.
+- **Hyperparameters**: `n_estimators=100` (sklearn default — no tuning data yet to justify
+  deviating), `contamination="auto"` (training data is anomaly-free by construction, so there's no
+  principled empirical contamination rate to supply; `"auto"` uses the original Isolation Forest
+  paper's score-offset formula instead of a guessed fraction — guessing one tuned toward the test
+  set's real anomaly rate would itself be a subtle form of leakage), `random_state=42` (fixed, so
+  the metrics embedded in the artifact are reproducible run to run).
+
+#### AD-19. Serialization: one joblib artifact, metadata embedded (not a sidecar file)
+
+- `backend/scripts/train.py` (the path Slice 1's AD-9 reserved) pulls `raw_metrics` +
+  `nab_anomaly_windows` from TimescaleDB, calls `app.ml.features` (AD-15), splits (AD-16), fits
+  (AD-18), evaluates (AD-17), and saves to `models/isolation_forest.joblib`.
+- **`models/` is a new top-level, gitignored directory** — mirrors AD-1's `data/`: an artifact
+  regenerable from code + data doesn't belong in git.
+- **One joblib file holding `{"model": ..., "metadata": {...}}`, not a model file plus a separate
+  metadata sidecar** — a sidecar can drift out of sync with the model it describes; a single
+  artifact can't.
+- **Metadata embedded**: `feature_version` (a string tied to AD-15's logic, so Slice 4 can assert
+  the model it loads matches the feature code it's running before trusting it), `window_minutes`,
+  `feature_names` (exact ordered column list — sklearn is order-sensitive at predict time),
+  `trained_at` (UTC ISO8601), `series_used`, `split_cutoffs` (the AD-16 timestamps, per series),
+  `model_params` (`n_estimators`, `contamination`, `random_state`), `sklearn_version`, and
+  `metrics` (AD-17's real measured precision/recall/F1, per-series and combined) — so anyone
+  loading the artifact later (Slice 4) sees what to expect without re-running evaluation.
+
+**Deferred (need Slice 4+ information):** how Slice 4's API loads/reloads this artifact; model
+retraining/versioning policy beyond a single `isolation_forest.joblib`; any feature beyond the 4 in
+AD-15 (e.g. day-of-week/hour-of-day seasonality) — not justified without first seeing whether the
+4 measured metrics need it.
+
 ## 5. Testing Strategy
 
 _(to define per slice — QE-senior posture: not just happy-path unit tests; realistic edge cases
@@ -402,6 +545,18 @@ diff:
 | Consumer restart mid-replay: kill and restart the consumer partway through, confirm no duplicate rows and no gaps once replay finishes | integration / compose | **real** | direct test of AD-13's idempotence claim, not just code review of the `ON CONFLICT` clause |
 | TimescaleDB stopped mid-replay: consumer blocks (doesn't crash, doesn't lose its offset), resumes and catches up once the DB is back | integration / compose | **real** | direct test of AD-13's retry-and-stall claim |
 | Producer emits messages keyed by `series_id` with the CSV's own timestamp in the payload (not `now()`) | unit | none — inspect produced messages directly | fast, deterministic check that the two-clocks separation in AD-12 wasn't accidentally collapsed |
+
+### Slice 3 — Model (proposed)
+
+The bar here is not "training finished without an exception" — it's the real measured precision/recall/F1 against the known windows:
+
+| Check | Kind | Real deps or mocks? | Why |
+|---|---|---|---|
+| `rolling_mean_1h`/`rolling_std_1h`/`rate_of_change` computed by hand on a small synthetic series, incl. a deliberate cadence gap, compared to `app.ml.features`'s output | unit | none | proves the time-based window (AD-15) handles the real gaps correctly, not just the happy path |
+| Rolling state does not cross a `series_id` boundary (two series' feature rows interleaved as input) | unit | none | catches the one bug class that would silently blend unrelated series' statistics |
+| Every training-set row's timestamp is strictly before that series' AD-16 cutoff (zero rows from inside or after any labeled window) | integration, against real stack | **real** | direct proof of the no-leakage claim, not just code review of the split logic |
+| Real `precision_score`/`recall_score`/`f1_score` per series and combined, from `backend/scripts/train.py` run against the real TimescaleDB data | integration, against real stack | **real** | the actual deliverable the task asks to see — printed/logged, not asserted against a made-up floor before the real numbers are known |
+| Loading `models/isolation_forest.joblib` back and re-predicting the same test set reproduces the same metrics | integration | **real** | proves the saved artifact is actually what was evaluated, not a save/load mismatch (feature order, missing metadata, etc.) |
 
 ## 6. Measurements Log
 
