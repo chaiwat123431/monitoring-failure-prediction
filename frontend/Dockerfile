@@ -34,7 +34,14 @@ RUN npm run build
 FROM node:22-slim AS prod
 
 WORKDIR /app
-ENV NODE_ENV=production PORT=3000
+# HOSTNAME=0.0.0.0 is required, not cosmetic: Docker sets a HOSTNAME env var in every container to
+# the container's own id/hostname, and Next.js's standalone server.js binds to `process.env.HOSTNAME`
+# when present — without this override it silently listens only on the container's bridge IP, not on
+# 127.0.0.1, which made this healthcheck (and any `localhost`-based check run *inside* the container)
+# fail with ECONNREFUSED despite the server logging "Ready" (found deploying to a real VPS, where the
+# healthcheck runs inside the container's own network namespace — a plain `docker run -p` from the
+# host doesn't expose this, since Docker's port-forwarding reaches the container's bridge IP anyway).
+ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0
 
 # .next/standalone already includes a pruned node_modules for exactly what the server needs;
 # .next/static is not part of it and must be copied alongside it (Next.js's own documented
