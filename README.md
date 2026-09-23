@@ -2,6 +2,19 @@
 
 See [PLANNING.md](./PLANNING.md) for architecture decisions and rationale.
 
+## Live demo
+
+**[https://89.167.113.165.sslip.io](https://89.167.113.165.sslip.io)**
+
+The chart shows a **static, already-completed replay of 14 days of real NAB CPU-utilization data**
+(both series, run once) — not a continuous live feed. The producer that replays NAB into Kafka is a
+manual, one-shot job by design (`PLANNING.md` AD-35), so no new points arrive after that single replay
+finishes. **The "Live" badge stays green regardless** — it reflects the WebSocket connection being
+open, not whether new data is currently flowing — so don't read a static chart as evidence the
+pipeline has stalled; it's the expected, deliberate state until the producer is re-run by hand.
+
+## Run
+
 ## Run
 
 ```bash
