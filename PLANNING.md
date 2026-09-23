@@ -1029,3 +1029,45 @@ _(transparency on what didn't work is part of the discipline — filled in as th
   in both `app/api/metrics.py` and `app/api/ws.py`.** No behavioral bug today, but the two copies
   could silently diverge under a future edit. Moved to a single `SERIES_IDS` constant in
   `app/ingestion/series_registry.py` (the module that already owns `SERIES`) and imported by both.
+
+**Second `/code-review high` pass, after the fixes above, per the task ("relance le code-review pour
+vérifier que les fixes tiennent") — found 3 more real issues in the same file, plus a repeat of the
+already-deferred connection-pooling note:**
+
+- **The live-feed loop accepted *any* `series_id` from the Kafka topic — unlike `/history` and the
+  WebSocket endpoint, which both validate against `SERIES_IDS` before doing anything.** Confirmed
+  directly: published a message with a bogus `series_id` straight to the topic (bypassing the
+  producer entirely) and it was silently accepted into `buffers` with zero trace anywhere. A stray
+  or malformed producer message would have grown `buffers` with a junk entry for the rest of the
+  container's life. Fixed by validating `series_id` against the same `SERIES_IDS` used by the
+  REST/WebSocket layer (§7's dedup above) and skip-and-log otherwise — re-ran the identical
+  reproduction after the fix and confirmed the message is now rejected with a visible log line.
+- **`_score_input_row` (rebuilding a small pandas DataFrame and recomputing the rolling features
+  from scratch on every incoming message) ran directly on the event loop, unlike `model.predict()`
+  right next to it, which AD-21 already measured and moved to `asyncio.to_thread()`.** Measured
+  directly on this project's real buffer size (~25 rows at NAB's cadence over `BUFFER_MINUTES`):
+  **~1.1ms** — the same order of magnitude as `model.predict()`'s own measured ~2.2ms, i.e. the exact
+  "non-negligible, don't block the loop" threshold AD-21 already established, just left unapplied to
+  this one call site. Fixed by running it through `asyncio.to_thread()` too, for the same reason.
+- **The main `async for msg in consumer:` loop had no exception handling of its own — only
+  per-message processing did.** If the underlying Kafka fetch ever raised instead of retrying
+  internally, the whole live-feed task would die silently, exactly like the buffer-seeding and
+  topic-assignment races already fixed earlier in this same file. **Tried hard to reproduce and
+  could not**: a `docker compose restart redpanda` and a full 40-second `docker compose stop
+  redpanda` (well beyond a normal healthcheck cycle) both recovered on their own via aiokafka's
+  internal reconnect logic — confirmed with a real WebSocket client receiving live, correctly-scored
+  messages again after each outage, with no task restart needed. Fixed anyway, as defense in depth:
+  extracted the consumer lifecycle into `_consume_forever()` and wrapped it in an outer
+  retry-with-backoff loop in `run_live_feed()`, consistent with the retry-don't-die pattern already
+  applied twice in this file. Documented as *not empirically confirmed dead*, unlike the other
+  findings in this section — applied for consistency and because aiokafka's internal retry coverage
+  isn't a documented guarantee, not because a live failure was observed.
+- **The same per-request-connection-pooling observation from the first review pass was raised again,
+  now also naming `feed_consumer.py`'s per-seed-cycle connection as a third instance of the same
+  pattern.** No new information changes the earlier call: still deferred, still not a measured
+  problem at this project's single-user MVP scale (PLANNING §2).
+
+Added `backend/tests/unit/test_feed_consumer.py` (previously nonexistent) covering the unknown-
+`series_id` skip and the outer loop's retry-after-failure behavior. Re-ran the full empirical bar
+once more after all of the above, on a stack rebuilt from these fixes: 1,518/1,518 live messages
+matched `model.predict()` independently — 0 mismatches. 55/55 backend tests pass.
