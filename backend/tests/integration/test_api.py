@@ -55,6 +55,26 @@ def test_history_row_values_match_raw_metrics_exactly(client):
         assert row["value"] == db_value
 
 
+def test_history_accepts_naive_start_end_as_utc(client):
+    """Found by /code-review, confirmed by reproduction against the real server (a plain 500):
+    Postgres returns tz-aware `time` values, but a start/end query param with no UTC offset
+    (e.g. "2014-04-15T00:00:00") parses as a *naive* datetime, and comparing the two raised
+    TypeError. Naive input must be treated as UTC (AD-12's convention), not crash."""
+    start = WINDOW.start - timedelta(hours=1)
+    end = WINDOW.start + timedelta(hours=1)
+
+    response = client.get(
+        f"/api/series/{SERIES_ID}/history",
+        params={
+            "start": start.replace(tzinfo=None).isoformat(),
+            "end": end.replace(tzinfo=None).isoformat(),
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["history"]) > 0
+
+
 def test_history_labeled_windows_include_the_known_anomaly(client):
     start = WINDOW.start - timedelta(hours=1)
     end = WINDOW.end + timedelta(hours=1)

@@ -46,3 +46,8 @@ SERIES: tuple[SeriesSpec, ...] = (
         ),
     ),
 )
+
+# Single source of truth for "is this a known series_id" (Slice 4's REST/WebSocket validation) —
+# was duplicated identically in app/api/metrics.py and app/api/ws.py; kept here instead so the two
+# can't silently diverge on which series_id values are valid.
+SERIES_IDS = frozenset(s.series_id for s in SERIES)

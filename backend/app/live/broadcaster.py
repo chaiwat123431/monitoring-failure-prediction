@@ -5,7 +5,7 @@ connected for, so nothing server-side needs to filter a shared stream.
 
 from collections import defaultdict
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 
 
 class ConnectionManager:
@@ -23,5 +23,10 @@ class ConnectionManager:
         for websocket in list(self._connections.get(series_id, ())):
             try:
                 await websocket.send_json(message)
-            except Exception:
+            except (WebSocketDisconnect, RuntimeError):
+                # Starlette raises WebSocketDisconnect for a broken connection (converted from
+                # OSError) and RuntimeError for sending on an already-closed socket — both mean
+                # "this client is gone." Anything else (e.g. a TypeError from send_json's own
+                # json.dumps on a bad `message`) is a real bug and must propagate, not be silently
+                # misread as a disconnect and swallowed.
                 self.disconnect(series_id, websocket)

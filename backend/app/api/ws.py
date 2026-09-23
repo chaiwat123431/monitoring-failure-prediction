@@ -5,16 +5,14 @@ range it wants to chart, then open this socket for the live tail (AD-23).
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.ingestion.series_registry import SERIES
+from app.ingestion.series_registry import SERIES_IDS
 
 router = APIRouter()
-
-_SERIES_IDS = {s.series_id for s in SERIES}
 
 
 @router.websocket("/ws/series/{series_id:path}/live")
 async def series_live(websocket: WebSocket, series_id: str) -> None:
-    if series_id not in _SERIES_IDS:
+    if series_id not in SERIES_IDS:
         await websocket.close(code=1008, reason=f"unknown series_id: {series_id}")
         return
 

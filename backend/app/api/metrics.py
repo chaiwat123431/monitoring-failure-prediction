@@ -3,19 +3,17 @@
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import psycopg
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from app.config import settings
-from app.ingestion.series_registry import SERIES
+from app.ingestion.series_registry import SERIES, SERIES_IDS
 from app.ml.features import FEATURE_NAMES, WINDOW_MINUTES, compute_features
 
 router = APIRouter(prefix="/api")
-
-_SERIES_IDS = {s.series_id for s in SERIES}
 
 
 @router.get("/series")
@@ -30,8 +28,18 @@ async def series_history(series_id: str, start: datetime, end: datetime, request
     ground-truth windows overlapping the range, kept as a separate array rather than a per-row
     column (AD-11's leak-avoidance discipline applied at the API boundary too).
     """
-    if series_id not in _SERIES_IDS:
+    if series_id not in SERIES_IDS:
         raise HTTPException(status_code=404, detail=f"unknown series_id: {series_id}")
+
+    # A `start`/`end` with no UTC offset (e.g. "2014-04-15T00:00:00") parses as a *naive* datetime,
+    # while every `time` value from Postgres (TIMESTAMPTZ) is tz-aware — comparing the two raises
+    # TypeError. Treat a naive input as UTC (AD-12's own convention for this project's timestamps)
+    # rather than erroring or guessing the caller's local zone.
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
     if start >= end:
         raise HTTPException(status_code=400, detail="start must be before end")
 

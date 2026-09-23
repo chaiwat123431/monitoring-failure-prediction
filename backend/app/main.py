@@ -33,6 +33,10 @@ async def lifespan(app: FastAPI):
             await live_feed_task
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            # Never let a stray failure from the background task escape shutdown silently —
+            # would otherwise turn a clean `docker compose down`/reload into an opaque traceback.
+            print(f"api: live-feed task ended with an unexpected error: {exc}")
 
 
 app = FastAPI(title="monitoring-failure-prediction", lifespan=lifespan)

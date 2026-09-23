@@ -52,6 +52,33 @@ async def _seed_buffer(conn: psycopg.AsyncConnection, series_id: str) -> deque:
     return deque({"time": pd.Timestamp(t), "value": v} for t, v in rows)
 
 
+async def _seed_all_buffers() -> dict[str, deque]:
+    """Retries with backoff instead of dying on the first failure — mirrors AD-13's
+    "TimescaleDB unavailable, retry, don't crash" stance and AD-22's own topic-not-ready retry.
+
+    Found by testing the actual startup ordering, not by reading the code: `backend` only depends
+    on redpanda/timescaledb being *healthy* (docker-compose.yml), not on `migrate` having *finished*
+    creating raw_metrics/nab_anomaly_windows. A one-shot query here raised `UndefinedTable` on a
+    fresh stack where backend and migrate start concurrently, which killed this task permanently —
+    silently: no log, `/health` stayed 200, and the WebSocket kept accepting connections that never
+    received a single live update for the rest of the container's life, even long after migrate
+    finished and real data started flowing (confirmed directly: reproduced with migrate skipped
+    entirely, then ran migrate + a producer replay afterward and confirmed the already-started
+    backend's live feed stayed dead).
+    """
+    delay = 0.5
+    while True:
+        try:
+            async with await psycopg.AsyncConnection.connect(settings.database_url) as conn:
+                return {
+                    series.series_id: await _seed_buffer(conn, series.series_id) for series in SERIES
+                }
+        except psycopg.Error as exc:
+            print(f"live-feed: DB not ready for buffer seeding yet ({exc}), retrying in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10)
+
+
 def _score_input_row(buffer: deque, series_id: str) -> pd.DataFrame | None:
     """Runs the *same* app.ml.features.compute_features used offline (AD-21) on this series'
     buffer, returning its last row (the just-arrived point) or None if it doesn't survive
@@ -99,10 +126,7 @@ async def run_live_feed(app_state, connections: ConnectionManager) -> None:
     """`app_state` is FastAPI's `app.state` (Starlette `State`) — read fresh each iteration
     (`app_state.model`, not a value captured once at task start) so this task always sees whatever
     main.py's lifespan currently has loaded, per AD-21."""
-    buffers: dict[str, deque] = {}
-    async with await psycopg.AsyncConnection.connect(settings.database_url) as conn:
-        for series in SERIES:
-            buffers[series.series_id] = await _seed_buffer(conn, series.series_id)
+    buffers = await _seed_all_buffers()
 
     consumer = AIOKafkaConsumer(bootstrap_servers=settings.kafka_bootstrap_servers)
     await consumer.start()
@@ -117,34 +141,40 @@ async def run_live_feed(app_state, connections: ConnectionManager) -> None:
                 # scored is skipped, not allowed to crash a task nothing else depends on.
                 continue
 
-            series_id = payload["series_id"]
-            buffer = buffers.setdefault(series_id, deque())
-            buffer.append({"time": pd.Timestamp(payload["timestamp"]), "value": payload["value"]})
-            cutoff = buffer[-1]["time"] - timedelta(minutes=BUFFER_MINUTES)
-            while buffer and buffer[0]["time"] < cutoff:
-                buffer.popleft()
+            try:
+                series_id = payload["series_id"]
+                buffer = buffers.setdefault(series_id, deque())
+                buffer.append({"time": pd.Timestamp(payload["timestamp"]), "value": payload["value"]})
+                cutoff = buffer[-1]["time"] - timedelta(minutes=BUFFER_MINUTES)
+                while buffer and buffer[0]["time"] < cutoff:
+                    buffer.popleft()
 
-            model = app_state.model
-            is_anomaly = None
-            if model is not None:
-                last_row = _score_input_row(buffer, series_id)
-                if last_row is not None:
-                    x = last_row[FEATURE_NAMES].to_numpy()
-                    # model.predict is a synchronous, CPU-bound scikit-learn call — measured at
-                    # ~2ms/row against the real artifact (PLANNING.md AD-21). Run off the event
-                    # loop so it can't stall other WebSocket connections or /health in the meantime.
-                    y_pred = await asyncio.to_thread(model.predict, x)
-                    is_anomaly = bool(y_pred[0] == -1)
+                model = app_state.model
+                is_anomaly = None
+                if model is not None:
+                    last_row = _score_input_row(buffer, series_id)
+                    if last_row is not None:
+                        x = last_row[FEATURE_NAMES].to_numpy()
+                        # model.predict is a synchronous, CPU-bound scikit-learn call — measured
+                        # at ~2ms/row against the real artifact (AD-21). Run off the event loop so
+                        # it can't stall other WebSocket connections or /health meanwhile.
+                        y_pred = await asyncio.to_thread(model.predict, x)
+                        is_anomaly = bool(y_pred[0] == -1)
 
-            await connections.broadcast(
-                series_id,
-                {
-                    "series_id": series_id,
-                    "timestamp": payload["timestamp"],
-                    "value": payload["value"],
-                    "is_anomaly": is_anomaly,
-                    "model_loaded": model is not None,
-                },
-            )
+                await connections.broadcast(
+                    series_id,
+                    {
+                        "series_id": series_id,
+                        "timestamp": payload["timestamp"],
+                        "value": payload["value"],
+                        "is_anomaly": is_anomaly,
+                        "model_loaded": model is not None,
+                    },
+                )
+            except Exception as exc:
+                # One message's worth of scoring/broadcast failing (e.g. a genuine bug, not a
+                # dead socket — ConnectionManager.broadcast already handles dead sockets itself)
+                # must not take the whole live feed down for every series' every future client.
+                print(f"live-feed: failed to process a message for {series_id!r}, skipping: {exc}")
     finally:
         await consumer.stop()

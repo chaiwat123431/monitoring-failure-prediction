@@ -972,3 +972,60 @@ _(transparency on what didn't work is part of the discipline — filled in as th
   Fixed by using the `:path` path converter (`{series_id:path}`) on both routes, which greedily
   matches everything up to the required literal suffix (`/history` or `/live`). Confirmed against
   the real stack afterward: both routes resolve correctly for both series IDs.
+- **`/code-review high` on PR #4 found a real `docker-compose.yml` startup race this slice
+  introduced: `backend` depended on `redpanda`/`timescaledb` being healthy, but not on `migrate`
+  having *finished* creating `raw_metrics`/`nab_anomaly_windows`** — a gap that didn't matter before
+  Slice 4 (nothing at backend startup touched the DB) but does now that the live-feed task's buffer
+  seeding queries `raw_metrics` at startup. Reproduced directly, twice: (1) a normal
+  `docker compose up` from empty volumes showed `migrate` finishing only ~1.1s before backend's
+  first DB query — close enough to be a real, not theoretical, race; (2) the worst case, starting
+  `backend` with `migrate` never having run at all, made the live-feed task die with an uncaught
+  `UndefinedTable` from `_seed_buffer` — silently: no log line, `/health` stayed `200`, and a
+  WebSocket client kept getting accepted connections that received **zero** messages for the rest of
+  the container's life, confirmed to never recover even after running `migrate` and a full producer
+  replay afterward against that same already-started backend. Fixed two ways: (a) added
+  `migrate: condition: service_completed_successfully` to `backend`'s `depends_on`
+  (`docker-compose.yml`), matching `producer`/`consumer`'s existing convention, which removes the
+  race in normal usage; (b) defense in depth regardless — buffer seeding
+  (`feed_consumer._seed_all_buffers`) now retries with exponential backoff on `psycopg.Error`
+  instead of raising once, mirroring AD-13's ingestion-consumer stance and AD-22's own
+  topic-not-ready retry. Re-ran the exact worst-case reproduction (`backend` started with `migrate`
+  never run) after the fix: the task now logs visible retry lines instead of dying, and once
+  `migrate` + a producer replay ran afterward, that same long-running backend process picked up and
+  started streaming real scored predictions on its own — confirmed with a real WebSocket client.
+- **Same review pass: `ConnectionManager.broadcast()`'s bare `except Exception` around
+  `send_json()` would silently misclassify a real bug as a dead client.** `send_json()` calls
+  `json.dumps()` *before* touching the socket (confirmed by reading Starlette's source directly,
+  not assumed) — a non-serializable value in the broadcast message raises `TypeError` there, before
+  any connection-related failure is even possible, while an actually-broken connection surfaces as
+  `WebSocketDisconnect` or `RuntimeError` (also confirmed from Starlette's `WebSocket.send()`
+  source). The bare `except Exception` treated both identically: silently disconnect the client and
+  drop the message, with no way to tell "client went away" from "we sent it garbage." Not
+  triggered by any data this slice currently sends, so this was a latent gap rather than a live
+  failure — fixed anyway by narrowing the `except` to `(WebSocketDisconnect, RuntimeError)`, so a
+  future serialization bug propagates loudly instead of vanishing. Added
+  `backend/tests/unit/test_broadcaster.py` cases proving a `TypeError` now propagates (socket stays
+  registered) while a `WebSocketDisconnect`/`RuntimeError` is still treated as gone. Also added a
+  broad `try/except` around each message's scoring+broadcast in `run_live_feed`'s main loop, so one
+  bad message still can't take the whole live-feed task down for every connected client.
+- **Same review pass: a `start`/`end` query param on `/api/series/{id}/history` with no UTC offset
+  crashed with a `500`.** FastAPI/pydantic parses `"2014-04-15T00:00:00"` (no trailing `Z`/offset)
+  as a *naive* `datetime`, while every `time` value read back from TimescaleDB (`TIMESTAMPTZ`) is
+  tz-aware — reproduced directly against the running server (a plain `500 Internal Server Error`)
+  before touching any code. Fixed by normalizing a naive `start`/`end` to UTC right after parsing
+  (AD-12's own convention: this project's timestamps are UTC when no zone is given), rather than
+  erroring or guessing the caller's local zone. Added a regression test
+  (`test_history_accepts_naive_start_end_as_utc`) to `tests/integration/test_api.py`.
+- **Same review pass, acknowledged but not fixed: `/api/series/{id}/history` opens a new
+  `psycopg` connection per request instead of using a pool.** Real observation, not disputed — but
+  at this project's actual scale (single-user MVP, PLANNING §2; 2 series; no measured concurrent
+  load) it isn't a live problem, and adding pooling (a new dependency, `psycopg_pool`, plus lifespan
+  wiring) for a cost that hasn't been measured would be exactly the premature optimization this
+  project's own conventions argue against elsewhere (e.g. Slice 2 AD-13's rejected batching, decided
+  the same way: measure first, don't add complexity for a bottleneck that isn't there yet). Deferred
+  to Slice 5+ if a real dashboard's polling pattern ever measurably needs it — same treatment as
+  `_SERIES_IDS`'s dedup below, both filed rather than silently dropped.
+- **Same review pass: `_SERIES_IDS` (the "is this a known series_id" set) was defined identically
+  in both `app/api/metrics.py` and `app/api/ws.py`.** No behavioral bug today, but the two copies
+  could silently diverge under a future edit. Moved to a single `SERIES_IDS` constant in
+  `app/ingestion/series_registry.py` (the module that already owns `SERIES`) and imported by both.
