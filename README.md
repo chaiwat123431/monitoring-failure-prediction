@@ -46,3 +46,8 @@ uv sync --group dev
 uv run pytest                 # unit tests, no real dependencies
 uv run pytest -m integration  # requires `docker compose up` running, incl. migrate/producer/consumer
 ```
+
+## Deploy
+
+See [`deploy/fly/README.md`](./deploy/fly/README.md) for the Fly.io deployment steps (the same
+`docker-compose.fly.yml` stack this repo runs locally, on one host — `PLANNING.md` §4 AD-30..AD-35).

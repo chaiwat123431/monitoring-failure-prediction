@@ -1,0 +1,47 @@
+# PLANNING.md Slice 6 (AD-30..AD-34). Rename `app` to a globally-unique name before the first
+# `fly launch`/`fly deploy` — Fly app names are a shared namespace. Pick `primary_region` to
+# whichever Fly region (`fly platform regions`) is closest to you or your intended audience.
+app = "monitoring-failure-prediction"
+primary_region = "iad"
+
+compose = "docker-compose.fly.yml"
+
+# AD-31: compose's own named volumes are ignored by Fly — real persistence needs Fly Volumes,
+# created once via `fly volumes create redpanda_data --size 1` / `fly volumes create
+# timescaledb_data --size 1` (adjust size if the dataset grows beyond AD-10's 2 fixed series), then
+# mounted here. `processes` scopes each mount to the compose service that owns that data directory —
+# least-verified part of this config (AD-34): confirm against the real first `fly deploy` that Fly's
+# compose engine honors per-service scoping this way, and adjust if it instead expects a different
+# shape.
+[[mounts]]
+  source = "redpanda_data"
+  destination = "/var/lib/redpanda/data"
+  processes = ["redpanda"]
+
+[[mounts]]
+  source = "timescaledb_data"
+  destination = "/var/lib/postgresql/data"
+  processes = ["timescaledb"]
+
+# /code-review high fix (Slice 6 PR #6): models/ (AD-19) is gitignored — this volume is how a
+# trained model artifact (deploy/fly/README.md's `train` step) survives a Machine restart and is
+# readable by `backend`. Shared by two processes — least-verified part of this file (see
+# docker-compose.fly.yml's own header comment): confirm one Fly Volume can actually be mounted by
+# both during the real first `fly deploy`.
+[[mounts]]
+  source = "models_data"
+  destination = "/app/models"
+  processes = ["backend", "train"]
+
+# AD-34: one public entry point — Caddy's port, not backend's or frontend's directly. Fly terminates
+# TLS at its edge and forwards plain HTTP here.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

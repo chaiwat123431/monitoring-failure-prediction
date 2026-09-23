@@ -3,14 +3,13 @@
 ## 1. Project Goal
 
 Portfolio project (solo, not production-grade) demonstrating a streaming data pipeline with
-ML-based anomaly/failure detection, built to match keywords explicitly listed in IBM Consulting's
-Machine Learning Developer Intern / AI & Automation Data Scientist Associate postings: Kafka,
-scikit-learn, real-time pipelines, MLOps-adjacent workflow. Secondary target: CGI AI innovation
-cell posting.
+ML-based anomaly/failure detection, built to match the skills typical ML/data-engineering and
+AI-automation job postings list explicitly: Kafka, scikit-learn, real-time pipelines, an
+MLOps-adjacent workflow, and containerized deployment.
 
-Not a deadline-blocking project — Project 1 (RAG Knowledge Assistant) already covers the CGI
-application. Priority here is doing the new stack (Kafka, TimescaleDB, WebSocket) correctly over
-doing it fast.
+Not a deadline-blocking project — another portfolio project already covers general
+application-readiness needs. Priority here is doing the new stack (Kafka, TimescaleDB, WebSocket)
+correctly over doing it fast.
 
 ## 2. MVP Scope (decided)
 
@@ -929,6 +928,224 @@ All of the above were restored to their original state afterward (`models/isolat
 moved back, `backend` restarted once more, confirmed healthy and scoring again) before this section
 was written.
 
+### Slice 6 — Deployment (status: CONFIGURED — code/config implemented and verified where possible without a Fly account; first real `fly deploy` still pending, see note at end)
+
+Scope guard: deploy the existing 4-service stack (Slices 1–5, frozen) to one public host, as close to
+`docker-compose.yml` as the host allows — not a re-architecture into per-provider managed services.
+Decided before this section was written (chat, not re-litigated here): a single paid host (~$5–7/mo)
+over either a $0 local-video demo or a $0-if-lucky multi-vendor managed-services split, specifically
+*because* running a real self-managed multi-container deployment demonstrates container
+orchestration/deployment skills this project exists to demonstrate (PLANNING §1) — a split across
+Render+Vercel-style platforms would demonstrate a different (already-held) skill instead.
+
+#### AD-30. Host: Fly.io — the only one of the three compared that runs the compose file as one host, not N billed services
+
+Researched concretely for this exact footprint (Redpanda + TimescaleDB + backend + frontend,
+always-on — no spin-down tier is usable here since the live-feed Kafka consumer must never stop):
+
+| | Fly.io | Railway | Render |
+|---|---|---|---|
+| Runs `docker-compose.yml` directly | **Yes** — `compose = "compose.yml"` in `fly.toml` deploys all containers to **one Fly Machine**, sharing one network namespace | No — compose services are auto-converted into **N separate Railway services** (N separate billing units) on import | No native compose import found; each service must be manually re-modeled as its own Render service |
+| Persistent volumes | Compose's own named volumes are **ignored**; real persistence needs separate Fly Volumes declared in `fly.toml` and mounted explicitly | Must manually create a matching Railway Volume per compose volume; not available at build time | Persistent disks only on **paid** services (no free tier option at all for a stateful broker/DB) |
+| Realistic monthly cost, this footprint | **~$6–7/mo**: one `shared-cpu-1x`/1GB Machine ($5.92/mo) + two small Fly Volumes (Redpanda + Timescale data, ~$0.15/GB/mo, negligible at this data volume) | Usage-metered (vCPU-hours + GB-hours + egress); exact rate card not pinned down, but 4 always-on services plausibly exceed the $5 Hobby included credit | **~$21–28/mo** — 4 separate Starter services ($7/mo each), since Render has no "one host, many containers" pricing unit at all |
+
+- **Why Fly wins for *this specific ask***: the user's own stated reason for choosing (b1) over a
+  managed-services split was demonstrating self-managed multi-container deployment — Railway's
+  auto-conversion-to-N-services and Render's total absence of compose support would both quietly turn
+  this back into "several small managed services," the exact shape (b1) was chosen to avoid, just
+  under one dashboard instead of three. Fly is also the cheapest of the three for this footprint.
+- **Real caveats that come with picking Fly** (kept, not hidden, since they change AD-31/32/34 below):
+  only one service in the compose file may specify `build:` — the rest need pre-built, pre-pushed
+  images; named volumes need explicit Fly Volume config; containers address each other via
+  `localhost:<port>` (shared network namespace), not the compose network's service-name DNS
+  (`redpanda:9092`, `timescaledb:5432` as used today); per-container restart isolation within one
+  Machine is not documented/confirmed (matters for AD-35).
+- **Rejected**: Railway (undermines the very reason (b1) was chosen — becomes a managed-services
+  split again, just single-vendor); Render (no compose support, ~3–4× the cost for this footprint,
+  free tier structurally unusable for an always-on Kafka consumer or persistent broker/DB).
+
+#### AD-31. A new `docker-compose.fly.yml` overlay — the existing dev compose file is not touched
+
+- **Named volumes → Fly Volumes**: `redpanda_data`/`timescaledb_data` (currently plain named volumes,
+  AD-2) get mounted from Fly Volumes declared in `fly.toml` instead — Fly ignores compose's own
+  volume declarations, so this is config Fly needs regardless of anything else here.
+- **`build:` → pre-built, pre-pushed `image:`**: Fly's compose deploy allows only one `build:` entry
+  across the whole file, but this project's compose file has `build: ./backend` on four services
+  (`backend`, `migrate`, `producer`, `consumer` — all sharing one Dockerfile/context already, AD-14)
+  plus `build: ./frontend`. The fix is mechanical, not architectural: build and push the backend and
+  frontend images to a registry (Fly's own `registry.fly.io/<app>` is the simplest, zero extra
+  account) as an explicit step *before* `fly deploy`, then reference `image: registry.fly.io/...` for
+  all five app-owned services (still just two actual images — `migrate`/`producer`/`consumer` already
+  only differ from `backend` by their `command:` override, unchanged by this). `redpanda`/
+  `timescaledb` keep their existing published images untouched.
+- **Service addressing: `localhost`, not service-name DNS**: a Fly compose Machine's containers share
+  one network namespace (confirmed in research, not assumed) — `KAFKA_BOOTSTRAP_SERVERS=redpanda:9092`
+  and `DATABASE_URL=...@timescaledb:5432/...` become `localhost:9092` / `localhost:5432` in the Fly
+  overlay's env values only; the dev compose file's values are untouched.
+- **Why an overlay file, not edits to `docker-compose.yml`**: AD-8 (Slice 1) explicitly deferred "a
+  production image and compose override" to this exact slice rather than guessing at it — a separate
+  `docker-compose.fly.yml` (referencing the same two Dockerfiles' new `prod` targets, AD-32) keeps
+  local dev (`docker compose up`, still the everyday workflow for continuing to build/test this
+  project) completely unaffected by any of Fly's constraints above.
+- **Rejected**: conditional logic inside one shared compose file (env-var-switched service addressing,
+  optional `build:`/`image:`) — harder to read than two small files, and this project's own
+  conventions already prefer an explicit overlay/second file over cleverness in one shared one (e.g.
+  AD-14's plain-SQL-over-Alembic reasoning, AD-19's one-file-not-a-sidecar reasoning going the other
+  direction for the same reason: don't split what must stay in sync, don't merge what serves two
+  genuinely different purposes).
+
+#### AD-32. Production Dockerfiles: a new `prod` stage per app, sibling to the existing `dev` stage — not a shared stage with flags
+
+- **Backend `prod` stage**: `uv sync --frozen` **without** `--group dev` (pytest/httpx have no
+  business in a runtime image), `CMD` drops `--reload` (no source bind-mount in prod, nothing to
+  reload), and runs a **single** uvicorn worker — deliberately not `--workers N`. Each worker would
+  run its own independent copy of the live-feed task (AD-22): its own groupless Kafka consumer, its
+  own per-series buffer-seeding queries against TimescaleDB, at this project's single-user demo scale
+  (PLANNING §2) for zero benefit — the same "don't scale before it's a measured problem" stance as
+  AD-13's rejected batching and AD-14's rejected Alembic. Same non-root user as `dev`.
+- **Frontend `prod` stage**: `next dev` is replaced with Next.js's standard production build path —
+  `output: "standalone"` added to `next.config.ts` (currently empty), a multi-stage `deps → build →
+  runner` Dockerfile stage copying only the standalone server output, running `node server.js`.
+- **The one item most worth flagging — `NEXT_PUBLIC_API_URL` must become a build `ARG`, not stay a
+  runtime `environment:` value**: Next.js bakes every `NEXT_PUBLIC_*` value into the client JS bundle
+  at `next build` time, not at container-start time. The current dev setup sets it as a plain runtime
+  `environment:` value in `docker-compose.yml` (AD-7) and this only *works* in dev because `next dev`
+  reads it live, without baking anything. A `prod` image built the same way — value only present at
+  *container start*, never at `docker build` time — would ship a client bundle with an empty or stale
+  API URL baked in, a bug that would only surface once deployed, not locally. Caught here, before
+  implementation, by tracing exactly how the current dev config actually reaches the browser instead
+  of assuming "it's just an env var." Fixed by declaring `ARG NEXT_PUBLIC_API_URL` + `ENV
+  NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL` before the `RUN npm run build` step in the frontend's
+  `prod` stage, and passing `--build-arg NEXT_PUBLIC_API_URL=https://<public-host>` at image-build
+  time (AD-31's pre-push step), not at `fly deploy`/container-start time.
+- **Rejected**: a further-minimized multi-stage backend build (copying just the built `.venv` into a
+  distroless final stage) — image size is not a measured problem at this project's scale on a
+  $6–7/mo machine with ordinary disk (PLANNING's own repeated "measure first" stance, AD-13/AD-14).
+
+#### AD-33. Secrets: the host's own secret store replaces `.env`; prod credentials are freshly generated, never the dev defaults
+
+- `fly secrets set DATABASE_URL=... KAFKA_BOOTSTRAP_SERVERS=... CORS_ALLOWED_ORIGINS=...` (etc.),
+  injected as env vars into the Machine at deploy time, never committed. `.env.example` stays exactly
+  what it already is — a **local-dev-only** reference — not extended to double as a prod template.
+- **Prod Postgres credentials are freshly generated, not `app`/`app`** (the current dev default). AD-2
+  already reasoned that "a dev DB and broker with default creds must not be reachable from the LAN"
+  is why every dev port is bound to `127.0.0.1` — a publicly reachable instance makes the same
+  principle non-negotiable rather than a nice-to-have, since there's no `127.0.0.1` binding to fall
+  back on for a service the whole point is to expose.
+- **New setting**: `cors_allowed_origins`, added to `Settings` (`app/config.py`) and read from an env
+  var — `main.py` currently hardcodes `allow_origins=["http://localhost:3000"]` directly in the
+  `CORSMiddleware` call, the one place in the whole backend that doesn't already go through
+  `config.py` (AD-5's own stated rule: "config.py is the only place that reads env vars"). Fixed as
+  part of this slice rather than carried forward as a second exception to a rule the codebase
+  otherwise holds everywhere else.
+
+#### AD-34. Public exposure: one public hostname, a small path-based proxy inside the Machine — not two separate public services
+
+- **A 5th compose service — a small Caddy (or nginx) container** — listens on the one port Fly
+  forwards publicly, and routes by path within the shared network namespace (AD-31): `/api/*` and
+  `/ws/*` → `localhost:8000` (backend), everything else → `localhost:3000` (frontend). TLS itself is
+  terminated by **Fly's own edge proxy** in front of the Machine's exposed `[http_service]` port (the
+  same mechanism any ordinary Fly App gets for free on `*.fly.dev`) — Caddy's job here is pure
+  internal path routing, not certificate management, so it needs no ACME config of its own.
+- **Why one hostname with path routing, not two public services (frontend + backend each exposed
+  separately)**: a Fly App has one hostname; exposing backend and frontend as two separately-routable
+  public endpoints would mean either a second Fly App (re-introducing the "N separate things to
+  manage" shape AD-30 was chosen specifically to avoid) or a non-standard port in the URL. Path
+  routing under one hostname sidesteps both.
+- **A genuine side benefit, not just a workaround**: with the frontend and `/api`/`/ws` served from
+  the *same* origin, the browser's calls to the backend become same-origin requests — the CORS
+  middleware (AD-33) becomes defensive/redundant for the actual public path rather than load-bearing,
+  a strictly better position than the current dev setup's real cross-origin split (`localhost:3000` →
+  `localhost:8000`, AD-7) requires CORS to bridge.
+- **This item is the least implementation-verified part of this proposal, stated plainly**: Fly's
+  exact `[http_service]`/multi-container-exposure wiring for a compose-deployed Machine specifically
+  (as opposed to a standard single-image Fly App, which is thoroughly documented) was not empirically
+  tested before writing this section — the plan above is the intended shape, to be confirmed against
+  the real Fly deploy during implementation and corrected here if reality disagrees, the same
+  propose-then-verify discipline every prior slice's empirical-verification section already follows.
+- **Rejected**: two separate Fly Apps (undoes AD-30's "one host" premise); exposing both ports
+  directly on non-standard public ports with no proxy (works, but loses the same-origin CORS benefit
+  and is a less standard shape for a public demo link to hand someone).
+
+#### AD-35. The producer is still a one-shot job in prod — kept manual for this slice, not automated
+
+- **The problem, restated precisely**: the producer (`restart: "no"`) replays the fixed 14-day NAB
+  dataset once and exits (AD-14). Once that single replay finishes, no further Kafka messages are
+  ever produced — the WebSocket stays open and correctly shows `"Live"`, but no new points arrive,
+  ever, until someone re-runs the producer. A visitor arriving after that point sees a complete,
+  correct, but static historical chart.
+- **A real, already-known trap if this were "solved" by just looping the producer on a timer**:
+  PLANNING §7 (Slice 4) already reproduced and documented this exact failure mode — re-running the
+  producer while the live-feed task's per-series buffer (AD-22) is warm from a previous run corrupts
+  the buffer's time-ordering assumption (the second run's messages are chronologically *before* the
+  first run's tail-end already in the buffer), producing genuinely wrong `is_anomaly` results, not
+  just a visual hiccup — measured directly as 510 mismatches when this was accidentally triggered
+  during Slice 4's own verification. That note explicitly named "the demo/deployment strategy (Slice
+  6)" as the moment this would need solving for real, which is now.
+  Restarting the backend before each re-run doesn't fully fix it either: `_seed_buffer` reseeds from
+  `raw_metrics`'s own already-ingested tail-end (AD-22), which is *still* chronologically after where
+  the next replay would start from — the only fully clean fix is resetting the data itself
+  (`TRUNCATE raw_metrics`) *and* restarting the backend *and* re-running the producer, together, in
+  that order — effectively a scheduled `docker compose down -v && up` equivalent cycle, not a small
+  addition.
+- **Decision for this slice: keep the producer manual — run it by hand (`fly ssh console` +
+  `docker compose run --rm producer`, mirroring today's exact local workflow) before pointing anyone
+  at the demo, rather than building a scheduled reset-and-replay cycle now.** This slice's scope guard
+  is deployment itself; a scheduled-freshness mechanism is a second, genuinely new category of
+  infrastructure (this project has no CI/scheduled automation of any kind yet, confirmed at the start
+  of this slice) for a need — the feed looking freshly "live" to an unattended visitor at 3 a.m. — that
+  a portfolio demo doesn't strictly have. This mirrors the exact reasoning that ruled out option (b2)
+  in the earlier hosting comparison: minimize new ongoing-maintenance surface for marginal polish.
+- **Not silently dropped — an explicit, named option if wanted later**: a scheduled GitHub Actions
+  workflow (cron trigger) calling `flyctl` to `TRUNCATE raw_metrics`, restart the Machine, and
+  re-invoke the producer on an interval (e.g. every 6h) would fully solve this, at the cost of adding
+  this project's first scheduled-automation surface and re-deriving the exact reset sequence above
+  correctly. Deferred, not rejected — flagged here so a future slice doesn't have to rediscover either
+  the need or the AD-22 trap from scratch.
+- **If run manually, pace it for a human to actually watch it stream**: at `REPLAY_SPEED=0` (dev's own
+  default, AD-12), the full 14-day series replays in a few seconds (PLANNING's own Slice 2
+  measurements log) — visually indistinguishable from the chart just loading fully-populated, which
+  defeats the point of a live demo. `REPLAY_SPEED=3600` (1 simulated hour per real *second*, per the
+  existing pacing semantics) replays the full ~336-hour series in ≈5.6 real minutes — long enough for
+  a visitor to actually watch points and anomaly flags arrive live, short enough not to require
+  leaving a demo running for hours. Set via the Fly overlay's `REPLAY_SPEED` value, not a code change.
+- **Rejected (for this slice)**: automated scheduled replay (the AD-22-trap-avoiding version is real
+  work, not appropriate to build in the same slice as the deployment itself, per the scope guard);
+  fixing `feed_consumer.py`'s buffer to tolerate arbitrary backward time jumps (the actually-general
+  fix, but Slice 4 already deferred it as out of scope, and nothing here removes that reasoning — it
+  is still not needed for the manual, single-clean-run-at-a-time usage this decision keeps).
+
+**Deferred (need Slice 6 implementation or explicit go-ahead):** the scheduled reset-and-replay
+automation named in AD-35; a custom domain (Fly's own `*.fly.dev` hostname is sufficient for a
+portfolio demo link); horizontal scaling of the Fly Machine (single-user MVP, PLANNING §2, unchanged
+by deployment).
+
+**Implementation note — what was actually verified, and what wasn't (stated plainly, matching this
+document's own discipline elsewhere: real numbers, not asserted from code review alone):**
+
+- **Verified locally, against the real toolchain**: both new Dockerfile `prod` stages
+  (`backend/Dockerfile`, `frontend/Dockerfile`) build clean; the frontend `prod` image, built with
+  `--build-arg NEXT_PUBLIC_API_URL=https://example.fly.dev`, was confirmed (by `grep`ing the built
+  `.next/static` output) to actually bake that URL into the client bundle — the exact AD-32 gotcha,
+  confirmed fixed, not just asserted; the backend `prod` image was run directly against this
+  project's real `redpanda`/`timescaledb` containers (on the existing compose network) with
+  `CORS_ALLOWED_ORIGINS=https://example.fly.dev` set, and `/health`, `/health/ready`, and a CORS
+  preflight against `/api/series` all returned correctly (the response's
+  `access-control-allow-origin` header matched the configured origin, confirming AD-33's new
+  `cors_allowed_origins` setting actually reaches `CORSMiddleware`, not just that the setting parses).
+  All 55 backend unit tests still pass unchanged.
+- **Not verified — no Fly.io account or `flyctl` exists in this environment, and creating one
+  (accepting Fly's terms, attaching a payment method) is not something to do without the project
+  owner present.** `fly.toml`, `docker-compose.fly.yml`, and `deploy/fly/Caddyfile` are written from
+  the researched constraints in AD-30/31/34, but the actual `fly deploy` — and specifically whether
+  the `[[mounts]]` `processes` scoping and the `${VAR}`-from-`fly-secrets` substitution assumed in
+  AD-31/AD-34 hold up against Fly's real compose-deploy engine — has not been run. `deploy/fly/
+  README.md` has the exact command sequence for the project owner to run themselves, and says
+  explicitly where to look (`fly logs`) and what to correct here if either assumption turns out
+  wrong, the same propose-then-verify-then-correct pattern every earlier slice's empirical section
+  already followed — this section should be updated with the real outcome once that first deploy
+  happens, rather than left claiming a verification that didn't happen.
+
 ## 5. Testing Strategy
 
 _(to define per slice — QE-senior posture: not just happy-path unit tests; realistic edge cases
@@ -1353,3 +1570,81 @@ All fixes re-verified against the real running stack via a live Chrome session (
 build, though all three stayed clean): the fetch-failure retry and the new error banner were both
 reproduced by stopping `backend` mid-session and on a fresh page load, confirming the fix in each
 case before restarting `backend` and confirming recovery. Squash-merged to `main` after this pass.
+
+### Slice 6 — Deployment
+
+`/code-review high` on PR #6 found two severe gaps and several real correctness/simplification
+issues before any of this had a chance to fail silently on a real deploy — exactly the value of
+running it before merging, since none of these would have thrown an error or failed a healthcheck:
+
+- **The trained model artifact had no path to the deployed Machine at all.** `models/` is gitignored
+  (AD-19) — local dev gets it via a bind mount (`./models:/app/models:ro`,
+  `docker-compose.yml`), but `docker-compose.fly.yml` had no volume, no Fly Volume, and no Dockerfile
+  `COPY` putting a model file anywhere on the Machine. `load_model()` would have found nothing,
+  `app.state.model` stayed `None` forever (AD-24's own "handled state," which is exactly why this
+  wouldn't have crashed or failed a healthcheck), and the deployed demo would silently never score a
+  single anomaly. Fixed by adding a `models_data` Fly Volume (`fly.toml`) shared between two new
+  processes: `backend` (reads) and a new one-shot `train` compose service (writes, running
+  `scripts/train.py` against the real deployed TimescaleDB once ingestion has real rows) —
+  `deploy/fly/README.md` now sequences producer -> train -> restart backend. Verified for real:
+  built the `prod` backend image, ran `scripts/train.py` inside it against this project's actual
+  local TimescaleDB (mounting a throwaway directory, not the real `models/`), and got the exact same
+  precision/recall/F1 numbers already on record in this document's Slice 3 measurements log
+  (0.126/0.825/0.218 for `ec2`, 0.322/0.769/0.454 for `rds`) — bit-for-bit consistent, not just "it
+  ran without an exception."
+- **The producer's NAB CSVs had no path to the deployed Machine either.** `docker-compose.fly.yml`
+  bind-mounted `./data:/data:ro` — a path that only exists on a developer's own checkout (`data/` is
+  gitignored, AD-1), never on a remote Fly Machine. Following `deploy/fly/README.md`'s own documented
+  producer step as originally written would have crashed with `FileNotFoundError`. Fixed by baking
+  the 2 NAB CSVs into the backend `prod` image at *build* time (`backend/Dockerfile`, fetched from
+  the same NAB GitHub URLs `scripts/fetch_nab_data.sh` already uses, at the exact `/data` path the
+  producer already defaults to — no env var or compose change needed) — AD-14's "the producer
+  container itself needs no internet access" still holds at *runtime*, unchanged; only the build step
+  gained a network dependency, which is normal. Verified by building the image for real and
+  confirming both CSVs land with the correct row counts (4,032 data rows each, matching AD-10).
+- **The Caddyfile routed `/health`/`/health/ready` to the frontend, not the backend — caught by
+  actually validating the config, not by reading it.** `backend/app/api/health.py` registers both
+  routes with no `/api` prefix, so they fell through the original `/api/*`/`/ws/*`-only rules into
+  the catch-all block, which forwards to the frontend (port 3000) — meaning `deploy/fly/README.md`'s
+  own post-deploy `curl .../health` check would have hit a Next.js 404, not the backend. Fixed by
+  adding a named `path` matcher covering `/api/*`, `/ws/*`, and `/health*` together. **A second,
+  real bug was caught fixing the first one**: the initial fix used `handle /api/* /ws/* /health* {
+  ... }`, assuming (wrongly) that `handle` takes multiple path arguments the way some other Caddy
+  directives do — running `caddy validate` against the actual Caddyfile (not just reading Caddy's
+  docs) failed immediately with a parse error, before this ever reached a real deploy. `handle` takes
+  exactly one argument; a named `path` matcher (which *does* accept several patterns) referenced by
+  `handle @name` is the correct shape, confirmed valid by the same `caddy validate` run. Further
+  confirmed with a real routing test: ran the built backend `prod` image and a Caddy container
+  sharing its network namespace (`docker run --network container:<backend>`, deliberately mirroring
+  how Fly's compose Machine shares one namespace across containers, AD-31) and hit Caddy's `:8080`
+  from outside — `/health` and `/api/series` both correctly reached the backend.
+- **`caddy`'s `depends_on` used plain service names instead of `condition: service_healthy`**, unlike
+  every other service in the same file. Since backend's own startup chain and frontend's healthcheck
+  both take real time, Caddy (the one public entry point) could start accepting traffic before either
+  was actually ready, turning the README's own immediate post-deploy verification into a race against
+  502s. Fixed to match the file's own established pattern.
+- **The `${POSTGRES_PASSWORD}`/`${FLY_APP_NAME}`/`${IMAGE_REGISTRY}` substitutions were documented as
+  coming from `fly secrets set` — which is not how Compose variable substitution works.** `${VAR}` in
+  a compose file is resolved by whatever process *parses that file* (locally, when `fly deploy` reads
+  it), not by anything injected into a container's runtime environment — `fly secrets` and compose
+  substitution are two unrelated mechanisms that happened to look interchangeable in the first draft.
+  This file's own header comment already flagged the substitution path as "least-verified," which
+  this confirmed was a concrete gap, not just a hedge: without exporting these in the *deploying*
+  shell, `DATABASE_URL` would silently resolve to a passwordless connection string and
+  `CORS_ALLOWED_ORIGINS` to `https://.fly.dev` (matching no real `Origin` header). Fixed by rewriting
+  `deploy/fly/README.md`'s secrets section to `export` all three in the same shell `fly deploy` runs
+  from, and correcting the compose file's own header comment to stop claiming otherwise.
+- **Minor — simplification**: `docker-compose.fly.yml` retyped `DATABASE_URL`/`KAFKA_BOOTSTRAP_SERVERS`
+  across four services instead of reusing an `x-backend-env` YAML anchor, unlike the sibling dev file
+  right next to it doing exactly that. Added the same anchor. Also hardcoded `app`/`monitoring`
+  instead of parameterizing `${POSTGRES_USER:-app}`/`${POSTGRES_DB:-monitoring}` the way the dev file
+  already does — fixed to match.
+- **Minor — the backend `prod` image shipped `tests/`** via an unqualified `COPY . .` with no
+  matching `.dockerignore` entry (only `.venv`/`__pycache__`/`.pytest_cache` were excluded). Added
+  `tests` to `backend/.dockerignore`; `scripts/` is kept, since the new `train` service (above) needs
+  `scripts/train.py` at runtime.
+
+Re-ran the full local verification pass after all of the above: both `prod` images still build
+clean, 55/55 backend tests still pass, local `docker compose up` dev workflow still fully unaffected.
+The real `fly deploy` itself remains not-yet-run (no Fly account in this environment, unchanged from
+before this review pass) — `deploy/fly/README.md` has the up-to-date command sequence.
