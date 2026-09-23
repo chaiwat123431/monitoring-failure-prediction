@@ -928,223 +928,153 @@ All of the above were restored to their original state afterward (`models/isolat
 moved back, `backend` restarted once more, confirmed healthy and scoring again) before this section
 was written.
 
-### Slice 6 — Deployment (status: CONFIGURED — code/config implemented and verified where possible without a Fly account; first real `fly deploy` still pending, see note at end)
+### Slice 6 — Deployment (status: PROPOSED — revised architecture, pending validation; supersedes an earlier Fly.io-based version that was implemented, tested against a real account, and reverted — see PLANNING §7 for the full story of that pivot, not glossed over here)
 
 Scope guard: deploy the existing 4-service stack (Slices 1–5, frozen) to one public host, as close to
 `docker-compose.yml` as the host allows — not a re-architecture into per-provider managed services.
-Decided before this section was written (chat, not re-litigated here): a single paid host (~$5–7/mo)
-over either a $0 local-video demo or a $0-if-lucky multi-vendor managed-services split, specifically
-*because* running a real self-managed multi-container deployment demonstrates container
-orchestration/deployment skills this project exists to demonstrate (PLANNING §1) — a split across
-Render+Vercel-style platforms would demonstrate a different (already-held) skill instead.
+Decided before this section was first written (chat, not re-litigated here): a single paid host
+(~$5–7/mo) over either a $0 local-video demo or a $0-if-lucky multi-vendor managed-services split,
+specifically *because* running a real self-managed multi-container deployment demonstrates container
+orchestration/deployment skills this project exists to demonstrate (PLANNING §1).
 
-#### AD-30. Host: Fly.io — the only one of the three compared that runs the compose file as one host, not N billed services
+**This section was rewritten once already.** The original version chose Fly.io on the strength of its
+documented `[build.compose]` support (deploy the compose file as one Machine). That was implemented in
+full (PR #6, merged) and then tested against a real Fly account: `fly deploy` never actually acted on
+`[build.compose]`, and Fly's own community forum confirms the feature is genuinely unstable
+("Docker Compose Compatibility: The Journey Begins" — the maintainer's own words: *"this is just the
+beginning — there is much more work to be done"*). PLANNING §7 has the full account, including what
+was real (the registry-path bug, the Caddyfile bug, both confirmed and fixed) and what turned out not
+to matter once Fly itself was abandoned. This section now documents the **replacement decision**: a
+plain VPS running `docker-compose.yml` unmodified.
 
-Researched concretely for this exact footprint (Redpanda + TimescaleDB + backend + frontend,
-always-on — no spin-down tier is usable here since the live-feed Kafka consumer must never stop):
+#### AD-30. Host: Hetzner Cloud (CX22) — a real VPS, not a PaaS with its own deploy abstraction
 
-| | Fly.io | Railway | Render |
+| | Hetzner CX22 | DigitalOcean (1–2GB droplet) | Fly.io (tried, reverted) |
 |---|---|---|---|
-| Runs `docker-compose.yml` directly | **Yes** — `compose = "compose.yml"` in `fly.toml` deploys all containers to **one Fly Machine**, sharing one network namespace | No — compose services are auto-converted into **N separate Railway services** (N separate billing units) on import | No native compose import found; each service must be manually re-modeled as its own Render service |
-| Persistent volumes | Compose's own named volumes are **ignored**; real persistence needs separate Fly Volumes declared in `fly.toml` and mounted explicitly | Must manually create a matching Railway Volume per compose volume; not available at build time | Persistent disks only on **paid** services (no free tier option at all for a stateful broker/DB) |
-| Realistic monthly cost, this footprint | **~$6–7/mo**: one `shared-cpu-1x`/1GB Machine ($5.92/mo) + two small Fly Volumes (Redpanda + Timescale data, ~$0.15/GB/mo, negligible at this data volume) | Usage-metered (vCPU-hours + GB-hours + egress); exact rate card not pinned down, but 4 always-on services plausibly exceed the $5 Hobby included credit | **~$21–28/mo** — 4 separate Starter services ($7/mo each), since Render has no "one host, many containers" pricing unit at all |
+| Runs `docker-compose.yml` directly, no translation | **Yes** — it's a Linux box; `docker compose up -d --build` against the real file, unmodified | Yes, same reason | **No, in practice** — `[build.compose]` is documented but non-functional against the real `fly deploy` as of this project's own test (PLANNING §7) |
+| Specs / price | 2 vCPU, 4 GB RAM, 40 GB disk — **~€3.79–4.35/mo (~$4–4.70/mo)** | 1 GB RAM/1 vCPU: $6/mo; 2 GB RAM/1 vCPU: $12/mo (both confirmed directly on digitalocean.com/pricing/droplets) | ~$6–7/mo (Machine + volumes) — moot, abandoned |
+| Maturity of "just run compose here" | As mature as Docker itself — the single most common way Docker Compose is deployed anywhere | Same | Marketplace/experimental-adjacent per Fly's own forum, confirmed broken in this project's hands |
 
-- **Why Fly wins for *this specific ask***: the user's own stated reason for choosing (b1) over a
-  managed-services split was demonstrating self-managed multi-container deployment — Railway's
-  auto-conversion-to-N-services and Render's total absence of compose support would both quietly turn
-  this back into "several small managed services," the exact shape (b1) was chosen to avoid, just
-  under one dashboard instead of three. Fly is also the cheapest of the three for this footprint.
-- **Real caveats that come with picking Fly** (kept, not hidden, since they change AD-31/32/34 below):
-  only one service in the compose file may specify `build:` — the rest need pre-built, pre-pushed
-  images; named volumes need explicit Fly Volume config; containers address each other via
-  `localhost:<port>` (shared network namespace), not the compose network's service-name DNS
-  (`redpanda:9092`, `timescaledb:5432` as used today); per-container restart isolation within one
-  Machine is not documented/confirmed (matters for AD-35).
-- **Rejected**: Railway (undermines the very reason (b1) was chosen — becomes a managed-services
-  split again, just single-vendor); Render (no compose support, ~3–4× the cost for this footprint,
-  free tier structurally unusable for an always-on Kafka consumer or persistent broker/DB).
+- **Why Hetzner over DigitalOcean**: more RAM per dollar for this footprint (Redpanda + TimescaleDB +
+  Python backend + Node frontend running concurrently benefits from headroom beyond the 1 GB tier, and
+  DigitalOcean's matching 2 GB tier costs ~2.5–3× as much for the same result). Both are otherwise
+  equivalent for this use case (either has a ready-made "Docker on Ubuntu" marketplace image, so
+  neither needs a manual Docker install step) — this is a price call, not a capability difference.
+- **Why not retry Fly.io with the Machines API directly**: considered explicitly (see the chat
+  comparison this section is based on) — it would still need every one of the old AD-31/34
+  translations (`build:`→`image:`, `localhost` addressing, a Caddy proxy for one hostname), for zero
+  fidelity gain over a VPS, while carrying real residual risk of hitting more of the same platform's
+  documented immaturity on a scenario (8–9 interdependent containers with precise startup ordering)
+  none of Fly's own multi-container examples actually cover.
+- **Rejected**: Railway/Render (unchanged reasoning from the original comparison — both convert compose
+  into N separately-billed services, the exact shape a single self-managed host was chosen to avoid);
+  Fly.io Machines API (above).
 
-#### AD-31. A new `docker-compose.fly.yml` overlay — the existing dev compose file is not touched
+#### AD-31. No compose translation needed at all — `docker-compose.yml` runs exactly as it does locally
 
-- **Named volumes → Fly Volumes**: `redpanda_data`/`timescaledb_data` (currently plain named volumes,
-  AD-2) get mounted from Fly Volumes declared in `fly.toml` instead — Fly ignores compose's own
-  volume declarations, so this is config Fly needs regardless of anything else here.
-- **`build:` → pre-built, pre-pushed `image:`**: Fly's compose deploy allows only one `build:` entry
-  across the whole file, but this project's compose file has `build: ./backend` on four services
-  (`backend`, `migrate`, `producer`, `consumer` — all sharing one Dockerfile/context already, AD-14)
-  plus `build: ./frontend`. The fix is mechanical, not architectural: build and push the backend and
-  frontend images to a registry (Fly's own `registry.fly.io/<app>` is the simplest, zero extra
-  account) as an explicit step *before* `fly deploy`, then reference `image: registry.fly.io/...` for
-  all five app-owned services (still just two actual images — `migrate`/`producer`/`consumer` already
-  only differ from `backend` by their `command:` override, unchanged by this). `redpanda`/
-  `timescaledb` keep their existing published images untouched.
-- **Service addressing: `localhost`, not service-name DNS**: a Fly compose Machine's containers share
-  one network namespace (confirmed in research, not assumed) — `KAFKA_BOOTSTRAP_SERVERS=redpanda:9092`
-  and `DATABASE_URL=...@timescaledb:5432/...` become `localhost:9092` / `localhost:5432` in the Fly
-  overlay's env values only; the dev compose file's values are untouched.
-- **Why an overlay file, not edits to `docker-compose.yml`**: AD-8 (Slice 1) explicitly deferred "a
-  production image and compose override" to this exact slice rather than guessing at it — a separate
-  `docker-compose.fly.yml` (referencing the same two Dockerfiles' new `prod` targets, AD-32) keeps
-  local dev (`docker compose up`, still the everyday workflow for continuing to build/test this
-  project) completely unaffected by any of Fly's constraints above.
-- **Rejected**: conditional logic inside one shared compose file (env-var-switched service addressing,
-  optional `build:`/`image:`) — harder to read than two small files, and this project's own
-  conventions already prefer an explicit overlay/second file over cleverness in one shared one (e.g.
-  AD-14's plain-SQL-over-Alembic reasoning, AD-19's one-file-not-a-sidecar reasoning going the other
-  direction for the same reason: don't split what must stay in sync, don't merge what serves two
-  genuinely different purposes).
+This directly answers the question the Fly attempt forced onto the table: **on a real VPS, none of
+the old AD-31 (Fly) translations exist as a category of problem**:
 
-#### AD-32. Production Dockerfiles: a new `prod` stage per app, sibling to the existing `dev` stage — not a shared stage with flags
+- **No `build:`-count limit** — a VPS runs `docker compose build` as normal; every service keeps its
+  own `build:` entry, unchanged from `docker-compose.yml` today.
+- **No service-name-DNS-to-`localhost` rewrite** — compose's own bridge network already gives every
+  service DNS resolution by name (`redpanda:9092`, `timescaledb:5432`); this is exactly what local dev
+  already relies on, so prod uses the identical values.
+- **No image pre-build-and-push step, no registry** — the VPS builds the images itself, from the same
+  Dockerfiles, the same way `docker compose up --build` already works on a laptop.
+- **The only new file is a minimal `docker-compose.prod.yml` overlay** (`docker compose -f
+  docker-compose.yml -f docker-compose.prod.yml up -d --build`), adding exactly two things
+  `docker-compose.yml` doesn't have: the `caddy` service (AD-34) and the prod-only environment values
+  (`CORS_ALLOWED_ORIGINS`, a real `POSTGRES_PASSWORD`) that shouldn't live in the dev file's committed
+  defaults. Everything else — service definitions, networking, healthchecks, `depends_on` — is
+  inherited from `docker-compose.yml` unchanged, via compose's own multi-file merge (a real, mature,
+  extremely common docker-compose feature — not the same kind of "documented but unstable" territory
+  the Fly compose deploy turned out to be).
+- **Rejected**: keeping a full separate `docker-compose.prod.yml` copy (à la the abandoned
+  `docker-compose.fly.yml`) — there is nothing left to override that justifies a whole second file
+  once no image/networking translation is needed; an overlay merged on top of the real file is both
+  less code and structurally guarantees prod never silently drifts from what local dev already proves
+  works.
 
-- **Backend `prod` stage**: `uv sync --frozen` **without** `--group dev` (pytest/httpx have no
-  business in a runtime image), `CMD` drops `--reload` (no source bind-mount in prod, nothing to
-  reload), and runs a **single** uvicorn worker — deliberately not `--workers N`. Each worker would
-  run its own independent copy of the live-feed task (AD-22): its own groupless Kafka consumer, its
-  own per-series buffer-seeding queries against TimescaleDB, at this project's single-user demo scale
-  (PLANNING §2) for zero benefit — the same "don't scale before it's a measured problem" stance as
-  AD-13's rejected batching and AD-14's rejected Alembic. Same non-root user as `dev`.
-- **Frontend `prod` stage**: `next dev` is replaced with Next.js's standard production build path —
-  `output: "standalone"` added to `next.config.ts` (currently empty), a multi-stage `deps → build →
-  runner` Dockerfile stage copying only the standalone server output, running `node server.js`.
-- **The one item most worth flagging — `NEXT_PUBLIC_API_URL` must become a build `ARG`, not stay a
-  runtime `environment:` value**: Next.js bakes every `NEXT_PUBLIC_*` value into the client JS bundle
-  at `next build` time, not at container-start time. The current dev setup sets it as a plain runtime
-  `environment:` value in `docker-compose.yml` (AD-7) and this only *works* in dev because `next dev`
-  reads it live, without baking anything. A `prod` image built the same way — value only present at
-  *container start*, never at `docker build` time — would ship a client bundle with an empty or stale
-  API URL baked in, a bug that would only surface once deployed, not locally. Caught here, before
-  implementation, by tracing exactly how the current dev config actually reaches the browser instead
-  of assuming "it's just an env var." Fixed by declaring `ARG NEXT_PUBLIC_API_URL` + `ENV
-  NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL` before the `RUN npm run build` step in the frontend's
-  `prod` stage, and passing `--build-arg NEXT_PUBLIC_API_URL=https://<public-host>` at image-build
-  time (AD-31's pre-push step), not at `fly deploy`/container-start time.
-- **Rejected**: a further-minimized multi-stage backend build (copying just the built `.venv` into a
-  distroless final stage) — image size is not a measured problem at this project's scale on a
-  $6–7/mo machine with ordinary disk (PLANNING's own repeated "measure first" stance, AD-13/AD-14).
+#### AD-32. Production Dockerfiles: unchanged from the Fly attempt — confirmed still valid on a VPS
 
-#### AD-33. Secrets: the host's own secret store replaces `.env`; prod credentials are freshly generated, never the dev defaults
+Nothing here is host-specific; both `prod` stages stay exactly as built and verified before (backend:
+no dev deps, no `--reload`, single worker; frontend: real Next.js standalone build). The build-time
+NAB CSV fetch added to `backend/Dockerfile`'s `prod` stage during the earlier `/code-review high` pass
+is *more* useful on a VPS than it would have been on Fly, not less: it means the producer never needs
+`data/` bind-mounted or fetched separately on the server at all — the image already has it. The one
+thing that changes is cosmetic: `--build-arg NEXT_PUBLIC_API_URL=https://<public-host>` now takes the
+VPS's own domain/IP instead of a `*.fly.dev` one; the mechanism (a build `ARG`, not a runtime env var,
+because Next.js bakes `NEXT_PUBLIC_*` in at `next build` time) is identical and already verified.
 
-- `fly secrets set DATABASE_URL=... KAFKA_BOOTSTRAP_SERVERS=... CORS_ALLOWED_ORIGINS=...` (etc.),
-  injected as env vars into the Machine at deploy time, never committed. `.env.example` stays exactly
-  what it already is — a **local-dev-only** reference — not extended to double as a prod template.
-- **Prod Postgres credentials are freshly generated, not `app`/`app`** (the current dev default). AD-2
-  already reasoned that "a dev DB and broker with default creds must not be reachable from the LAN"
-  is why every dev port is bound to `127.0.0.1` — a publicly reachable instance makes the same
-  principle non-negotiable rather than a nice-to-have, since there's no `127.0.0.1` binding to fall
-  back on for a service the whole point is to expose.
-- **New setting**: `cors_allowed_origins`, added to `Settings` (`app/config.py`) and read from an env
-  var — `main.py` currently hardcodes `allow_origins=["http://localhost:3000"]` directly in the
-  `CORSMiddleware` call, the one place in the whole backend that doesn't already go through
-  `config.py` (AD-5's own stated rule: "config.py is the only place that reads env vars"). Fixed as
-  part of this slice rather than carried forward as a second exception to a rule the codebase
-  otherwise holds everywhere else.
+#### AD-33. Secrets: a `.env.prod` file on the server itself, never committed — the same shape as local dev, not a cloud provider's proprietary store
 
-#### AD-34. Public exposure: one public hostname, a small path-based proxy inside the Machine — not two separate public services
+- No platform secret store exists on a plain VPS — the direct equivalent of local dev's `.env`
+  (gitignored, AD-8) is a `.env.prod` created **directly on the server** (via `ssh` + a text editor, or
+  `scp`'d over once and never stored anywhere else), referenced by `docker compose --env-file
+  .env.prod -f docker-compose.yml -f docker-compose.prod.yml up -d`. Never generated or transmitted
+  through this assistant — the project owner creates it on the box themselves, the same boundary
+  already drawn for the Fly secrets step.
+- **Prod Postgres credentials are freshly generated, not `app`/`app`** (the current dev default) —
+  unchanged reasoning from the original AD-33: AD-2's "a dev DB and broker with default creds must not
+  be reachable from the LAN" becomes non-negotiable, not a nice-to-have, once there's no `127.0.0.1`
+  binding to fall back on for a service the whole point is to expose.
+- **`cors_allowed_origins`** (`app/config.py`, already implemented and merged) is unchanged — still the
+  fix for `main.py`'s one pre-existing exception to "config.py is the only place that reads env vars"
+  (AD-5), still populated from `.env.prod` the same way any other setting is.
 
-- **A 5th compose service — a small Caddy (or nginx) container** — listens on the one port Fly
-  forwards publicly, and routes by path within the shared network namespace (AD-31): `/api/*` and
-  `/ws/*` → `localhost:8000` (backend), everything else → `localhost:3000` (frontend). TLS itself is
-  terminated by **Fly's own edge proxy** in front of the Machine's exposed `[http_service]` port (the
-  same mechanism any ordinary Fly App gets for free on `*.fly.dev`) — Caddy's job here is pure
-  internal path routing, not certificate management, so it needs no ACME config of its own.
-- **Why one hostname with path routing, not two public services (frontend + backend each exposed
-  separately)**: a Fly App has one hostname; exposing backend and frontend as two separately-routable
-  public endpoints would mean either a second Fly App (re-introducing the "N separate things to
-  manage" shape AD-30 was chosen specifically to avoid) or a non-standard port in the URL. Path
-  routing under one hostname sidesteps both.
-- **A genuine side benefit, not just a workaround**: with the frontend and `/api`/`/ws` served from
-  the *same* origin, the browser's calls to the backend become same-origin requests — the CORS
-  middleware (AD-33) becomes defensive/redundant for the actual public path rather than load-bearing,
-  a strictly better position than the current dev setup's real cross-origin split (`localhost:3000` →
-  `localhost:8000`, AD-7) requires CORS to bridge.
-- **This item is the least implementation-verified part of this proposal, stated plainly**: Fly's
-  exact `[http_service]`/multi-container-exposure wiring for a compose-deployed Machine specifically
-  (as opposed to a standard single-image Fly App, which is thoroughly documented) was not empirically
-  tested before writing this section — the plan above is the intended shape, to be confirmed against
-  the real Fly deploy during implementation and corrected here if reality disagrees, the same
-  propose-then-verify discipline every prior slice's empirical-verification section already follows.
-- **Rejected**: two separate Fly Apps (undoes AD-30's "one host" premise); exposing both ports
-  directly on non-standard public ports with no proxy (works, but loses the same-origin CORS benefit
-  and is a less standard shape for a public demo link to hand someone).
+#### AD-34. Public exposure: Caddy still does path-based routing under one hostname — but now terminates its own TLS
+
+- **The routing shape is unchanged and already built/validated** (`deploy/fly/Caddyfile`, moved and
+  adjusted — see implementation section below): `/api/*`, `/ws/*`, `/health*` → `localhost:8000`
+  (backend), everything else → `localhost:3000` (frontend), via a named `path` matcher (the exact
+  syntax already confirmed correct with `caddy validate` and a real routing test during the Fly
+  attempt's `/code-review high` fix).
+- **What's different on a VPS: there is no edge proxy in front of Caddy anymore.** Fly's edge
+  terminated TLS for free; on a bare VPS, **Caddy itself must get a real certificate**, which means it
+  needs a real DNS name pointing at the server's IP — Let's Encrypt (Caddy's automatic-HTTPS default)
+  cannot issue a certificate for a bare IP address. **This is an open decision for the project owner,
+  not assumed here**: either (a) point a real domain/subdomain already owned at the VPS's IP, or (b) a
+  free DNS-wildcard-to-IP service (e.g. `<ip>.sslip.io`) works too — Let's Encrypt only needs a
+  resolvable public DNS name, not a purchased domain, and services like this exist exactly for
+  IP-only servers. Caddy's `Caddyfile` needs whichever hostname is chosen in place of the bare `:8080`
+  it used inside the Fly Machine (where Fly's own edge, not Caddy, held the certificate).
+- **Rejected**: a self-signed certificate (browsers flag it, undermining the exact "clickable public
+  link" impression this slice exists to create); plain HTTP with no TLS at all (mixed-content/`wss://`
+  problems, and a portfolio link that trips a browser warning is worse than no link).
 
 #### AD-35. The producer is still a one-shot job in prod — kept manual for this slice, not automated
 
-- **The problem, restated precisely**: the producer (`restart: "no"`) replays the fixed 14-day NAB
-  dataset once and exits (AD-14). Once that single replay finishes, no further Kafka messages are
-  ever produced — the WebSocket stays open and correctly shows `"Live"`, but no new points arrive,
-  ever, until someone re-runs the producer. A visitor arriving after that point sees a complete,
-  correct, but static historical chart.
-- **A real, already-known trap if this were "solved" by just looping the producer on a timer**:
-  PLANNING §7 (Slice 4) already reproduced and documented this exact failure mode — re-running the
-  producer while the live-feed task's per-series buffer (AD-22) is warm from a previous run corrupts
-  the buffer's time-ordering assumption (the second run's messages are chronologically *before* the
-  first run's tail-end already in the buffer), producing genuinely wrong `is_anomaly` results, not
-  just a visual hiccup — measured directly as 510 mismatches when this was accidentally triggered
-  during Slice 4's own verification. That note explicitly named "the demo/deployment strategy (Slice
-  6)" as the moment this would need solving for real, which is now.
-  Restarting the backend before each re-run doesn't fully fix it either: `_seed_buffer` reseeds from
-  `raw_metrics`'s own already-ingested tail-end (AD-22), which is *still* chronologically after where
-  the next replay would start from — the only fully clean fix is resetting the data itself
-  (`TRUNCATE raw_metrics`) *and* restarting the backend *and* re-running the producer, together, in
-  that order — effectively a scheduled `docker compose down -v && up` equivalent cycle, not a small
-  addition.
-- **Decision for this slice: keep the producer manual — run it by hand (`fly ssh console` +
-  `docker compose run --rm producer`, mirroring today's exact local workflow) before pointing anyone
-  at the demo, rather than building a scheduled reset-and-replay cycle now.** This slice's scope guard
-  is deployment itself; a scheduled-freshness mechanism is a second, genuinely new category of
-  infrastructure (this project has no CI/scheduled automation of any kind yet, confirmed at the start
-  of this slice) for a need — the feed looking freshly "live" to an unattended visitor at 3 a.m. — that
-  a portfolio demo doesn't strictly have. This mirrors the exact reasoning that ruled out option (b2)
-  in the earlier hosting comparison: minimize new ongoing-maintenance surface for marginal polish.
-- **Not silently dropped — an explicit, named option if wanted later**: a scheduled GitHub Actions
-  workflow (cron trigger) calling `flyctl` to `TRUNCATE raw_metrics`, restart the Machine, and
-  re-invoke the producer on an interval (e.g. every 6h) would fully solve this, at the cost of adding
-  this project's first scheduled-automation surface and re-deriving the exact reset sequence above
-  correctly. Deferred, not rejected — flagged here so a future slice doesn't have to rediscover either
-  the need or the AD-22 trap from scratch.
-- **If run manually, pace it for a human to actually watch it stream**: at `REPLAY_SPEED=0` (dev's own
-  default, AD-12), the full 14-day series replays in a few seconds (PLANNING's own Slice 2
-  measurements log) — visually indistinguishable from the chart just loading fully-populated, which
-  defeats the point of a live demo. `REPLAY_SPEED=3600` (1 simulated hour per real *second*, per the
-  existing pacing semantics) replays the full ~336-hour series in ≈5.6 real minutes — long enough for
-  a visitor to actually watch points and anomaly flags arrive live, short enough not to require
-  leaving a demo running for hours. Set via the Fly overlay's `REPLAY_SPEED` value, not a code change.
-- **Rejected (for this slice)**: automated scheduled replay (the AD-22-trap-avoiding version is real
-  work, not appropriate to build in the same slice as the deployment itself, per the scope guard);
-  fixing `feed_consumer.py`'s buffer to tolerate arbitrary backward time jumps (the actually-general
-  fix, but Slice 4 already deferred it as out of scope, and nothing here removes that reasoning — it
-  is still not needed for the manual, single-clean-run-at-a-time usage this decision keeps).
+Unchanged reasoning from the original AD-35 (none of it was Fly-specific):
+
+- The producer (`restart: "no"`) replays the fixed 14-day NAB dataset once and exits (AD-14); after
+  that, no new Kafka messages ever arrive until someone re-runs it.
+- Looping it on a timer would reproduce the exact buffer-ordering bug PLANNING §7 (Slice 4) already
+  measured (510 mismatches) — restarting the backend before each re-run doesn't fully fix it either,
+  since `_seed_buffer` reseeds from data still chronologically *after* where a fresh replay starts.
+  The only fully clean fix is a coordinated `TRUNCATE raw_metrics` + backend restart + producer re-run,
+  which is real scheduled-automation work this slice's scope guard doesn't include.
+- **Decision, updated for the new host**: run it by hand over `ssh <vps> 'docker compose -f
+  docker-compose.yml -f docker-compose.prod.yml run --rm producer'` — the same manual, on-demand shape
+  as before, `fly ssh console` replaced by plain `ssh` since there's no Fly Machine to shell into
+  anymore.
+- `REPLAY_SPEED=3600` (unchanged reasoning: ≈5.6 real minutes for the full series, long enough to
+  actually watch it stream) set via `docker-compose.prod.yml`'s environment for `producer`, not a code
+  change.
+- **Not silently dropped**: a scheduled GitHub-Actions-driven reset-and-replay cycle remains an
+  explicit, named, deferred option if wanted later, for the same reasons as before (this project has no
+  scheduled automation yet, and it's not needed for a portfolio link someone browses to and manually
+  replays for).
+
+**AD-34's domain decision, resolved**: [sslip.io](https://sslip.io) (`<vps-ip>.sslip.io`), not a
+purchased domain — confirmed by resolving it directly with `dig` before relying on it (both the
+dotted-IP and dashed-IP forms resolve correctly; the dotted form is used). Zero cost, zero DNS setup,
+and Let's Encrypt only needs a real resolvable hostname, which this is. `deploy/vps/README.md` names
+the one line to change if a real domain replaces it later.
 
 **Deferred (need Slice 6 implementation or explicit go-ahead):** the scheduled reset-and-replay
-automation named in AD-35; a custom domain (Fly's own `*.fly.dev` hostname is sufficient for a
-portfolio demo link); horizontal scaling of the Fly Machine (single-user MVP, PLANNING §2, unchanged
-by deployment).
-
-**Implementation note — what was actually verified, and what wasn't (stated plainly, matching this
-document's own discipline elsewhere: real numbers, not asserted from code review alone):**
-
-- **Verified locally, against the real toolchain**: both new Dockerfile `prod` stages
-  (`backend/Dockerfile`, `frontend/Dockerfile`) build clean; the frontend `prod` image, built with
-  `--build-arg NEXT_PUBLIC_API_URL=https://example.fly.dev`, was confirmed (by `grep`ing the built
-  `.next/static` output) to actually bake that URL into the client bundle — the exact AD-32 gotcha,
-  confirmed fixed, not just asserted; the backend `prod` image was run directly against this
-  project's real `redpanda`/`timescaledb` containers (on the existing compose network) with
-  `CORS_ALLOWED_ORIGINS=https://example.fly.dev` set, and `/health`, `/health/ready`, and a CORS
-  preflight against `/api/series` all returned correctly (the response's
-  `access-control-allow-origin` header matched the configured origin, confirming AD-33's new
-  `cors_allowed_origins` setting actually reaches `CORSMiddleware`, not just that the setting parses).
-  All 55 backend unit tests still pass unchanged.
-- **Not verified — no Fly.io account or `flyctl` exists in this environment, and creating one
-  (accepting Fly's terms, attaching a payment method) is not something to do without the project
-  owner present.** `fly.toml`, `docker-compose.fly.yml`, and `deploy/fly/Caddyfile` are written from
-  the researched constraints in AD-30/31/34, but the actual `fly deploy` — and specifically whether
-  the `[[mounts]]` `processes` scoping and the `${VAR}`-from-`fly-secrets` substitution assumed in
-  AD-31/AD-34 hold up against Fly's real compose-deploy engine — has not been run. `deploy/fly/
-  README.md` has the exact command sequence for the project owner to run themselves, and says
-  explicitly where to look (`fly logs`) and what to correct here if either assumption turns out
-  wrong, the same propose-then-verify-then-correct pattern every earlier slice's empirical section
-  already followed — this section should be updated with the real outcome once that first deploy
-  happens, rather than left claiming a verification that didn't happen.
+automation named in AD-35; horizontal scaling of the VPS (single-user MVP, PLANNING §2, unchanged by
+deployment).
 
 ## 5. Testing Strategy
 
@@ -1648,3 +1578,61 @@ Re-ran the full local verification pass after all of the above: both `prod` imag
 clean, 55/55 backend tests still pass, local `docker compose up` dev workflow still fully unaffected.
 The real `fly deploy` itself remains not-yet-run (no Fly account in this environment, unchanged from
 before this review pass) — `deploy/fly/README.md` has the up-to-date command sequence.
+
+**Fly.io was subsequently tried against a real account, found to be genuinely broken, and abandoned —
+the full story, not glossed over.** The project owner created a real Fly account, added a payment
+method, and worked through the deploy sequence live:
+
+- **A real registry-naming bug, found and fixed before the bigger problem surfaced.** The original
+  `docker-compose.fly.yml` referenced images as `${IMAGE_REGISTRY}/mfp-backend:prod` /
+  `.../mfp-frontend:prod` (one sub-path per image under the app's registry namespace) — `docker push`
+  failed with `404 Not Found` on the blob-upload endpoint. Fly's actual registry convention (confirmed
+  by testing the alternative directly, not by reading docs) is **one repository per app, distinguished
+  by tag** — `registry.fly.io/<app>:<tag>`, not `registry.fly.io/<app>/<image-name>:<tag>`. Fixed by
+  retagging both images as `${IMAGE_REGISTRY}:backend-prod` / `:frontend-prod`; both pushed
+  successfully once corrected. A second, unrelated push failure (also `404`) was traced to `docker
+  buildx`'s default attestation/provenance manifest, which Fly's registry doesn't accept — fixed with
+  `--provenance=false --sbom=false` on both builds.
+- **The core premise of AD-30 — that `fly deploy` runs a compose file as one Machine — did not hold up
+  against the real, current stable `flyctl` (v0.4.106).** `fly deploy` failed with `app does not have a
+  Dockerfile or buildpacks configured` despite a `[build.compose]` block that `fly config show`
+  confirmed was parsed correctly. The original `fly.toml` used a top-level `compose = "..."` key (a
+  transcription error, confirmed wrong against Fly's own docs, which specify a nested `[build.compose]`
+  table) — fixing that syntax error did not fix the underlying problem: `fly deploy` still refused to
+  recognize the compose config after the fix, tried both the default `compose.yml` filename and an
+  explicit `file =` override, with identical failures either way.
+- **Directly asking Fly's own documentation confirmed this is a known, acknowledged rough edge, not a
+  local mistake.** Fly's community forum ("Docker Compose Compatibility: The Journey Begins",
+  community.fly.io) has the Fly maintainer's own words: *"This is just the beginning — there is much
+  more work to be done,"* actively soliciting real-world use cases to prioritize further work, and
+  documents exactly the kind of failure mode hit here (`app does not have a Dockerfile or buildpacks
+  configured` appearing even with a seemingly-correct compose config) as a known, unresolved issue for
+  some users. This wasn't findable by reading Fly's marketing/guide-style documentation alone (which
+  presents `[build.compose]` as a shipped, working feature, `flyctl v0.3.152+`) — only by testing it
+  for real against a live account, and then specifically searching for others hitting the identical
+  error string, did the real (unstable, early-stage) status surface.
+- **Decision: abandon Fly.io for this project, before sinking more effort into working around an
+  admittedly-unstable feature.** The next-cheapest workaround (Fly's lower-level Machines API
+  `containers` array, bypassing the broken compose-translation layer) was evaluated and explicitly
+  *not* chosen: it would still require every one of AD-31/34's translations (`build:`→`image:`,
+  `localhost` addressing, a Caddy proxy for one hostname) for zero fidelity gain over a plain VPS,
+  while risking further undocumented rough edges on a use case (8–9 interdependent containers with
+  precise startup ordering) none of Fly's own multi-container examples actually resemble (they're all
+  1–2-container sidecar patterns — metrics collectors, secrets agents — not a full application stack).
+  Replaced with a plain VPS (Hetzner Cloud, current §4 AD-30..AD-35) that runs `docker-compose.yml`
+  completely unmodified — the single most mature, boring, well-trodden way to deploy Docker Compose
+  that exists, with none of AD-30's original comparison advantages ("one host, not N billed services")
+  lost, since a VPS *is* one host, natively, with zero translation layer to be unstable in the first
+  place.
+- **Real cloud resources were created and then fully torn down**: a Fly app, 3 Fly Volumes
+  (`redpanda_data`, `timescaledb_data`, `models_data`), and 2 pushed images. `fly apps destroy` was run
+  and confirmed via `fly apps list` (empty) and a volumes query against the now-nonexistent app
+  (`app not found`) — no residual Fly.io billing from this attempt. `fly.toml`, `docker-compose.fly.yml`,
+  and `deploy/fly/` are removed from the repo in the same change that introduces the VPS-based files
+  (§4's current AD-30..AD-35) — kept only in this section's history, not as dead config nobody should
+  run.
+- **What was still real and worth keeping, despite the platform being abandoned**: the registry-naming
+  fix and the earlier `/code-review high` fixes (Caddyfile routing, the model/dataset build-time
+  baking, the `x-backend-env` anchor, etc., all documented above) were genuine, transferable findings —
+  most carry over directly to the VPS-based Caddyfile and Dockerfiles unchanged, which is why AD-32
+  (Dockerfiles) in particular needed no rework at all for the new host.

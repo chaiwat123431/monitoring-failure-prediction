@@ -1,0 +1,70 @@
+# PLANNING.md Slice 6 (AD-30..AD-35, VPS revision). A merge overlay on top of docker-compose.yml —
+# not a standalone copy — because a plain VPS needs no build:/image:/networking translation (AD-31):
+# `docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod up -d --build`
+#
+# Every `volumes: !override [...]` below exists because Compose's default list-merge is
+# *concatenation*, not replacement — confirmed empirically (not assumed) with `docker compose config`
+# before this file was written: an empty `volumes: []` override left docker-compose.yml's dev bind
+# mounts fully intact. `!override` (Compose Specification's merge-control tag) is what actually
+# replaces the list. Without this, the dev source bind-mount would shadow the built prod image's own
+# code, and producer's `./data:/data:ro` bind mount would shadow the NAB CSVs baked into the backend
+# prod image at build time (backend/Dockerfile), silently reintroducing the exact "no NAB data on the
+# server" bug the Fly.io attempt hit (PLANNING §7).
+
+services:
+  backend:
+    build:
+      target: prod
+    volumes: !override
+      - ./models:/app/models
+    environment:
+      CORS_ALLOWED_ORIGINS: https://${PUBLIC_HOSTNAME}
+
+  migrate:
+    build:
+      target: prod
+
+  producer:
+    build:
+      target: prod
+    volumes: !override []
+    environment:
+      REPLAY_SPEED: "3600"
+
+  consumer:
+    build:
+      target: prod
+
+  frontend:
+    build:
+      target: prod
+      args:
+        NEXT_PUBLIC_API_URL: https://${PUBLIC_HOSTNAME}
+    volumes: !override []
+
+  # AD-34: the one public entry point. Unlike the abandoned Fly version, there is no edge proxy in
+  # front of this — Caddy terminates its own TLS via its built-in automatic HTTPS (Let's Encrypt),
+  # which needs ports 80 (ACME HTTP-01 challenge + HTTP->HTTPS redirect) and 443 published for real,
+  # not just an internal port. Reaches backend/frontend by compose's own service-name DNS
+  # (`backend:8000`, `frontend:3000`) — a plain VPS never needed Fly's shared-namespace `localhost`
+  # addressing in the first place (AD-31).
+  caddy:
+    image: caddy:2-alpine
+    volumes:
+      - ./deploy/vps/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME}
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:

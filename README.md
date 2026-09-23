@@ -49,5 +49,6 @@ uv run pytest -m integration  # requires `docker compose up` running, incl. migr
 
 ## Deploy
 
-See [`deploy/fly/README.md`](./deploy/fly/README.md) for the Fly.io deployment steps (the same
-`docker-compose.fly.yml` stack this repo runs locally, on one host — `PLANNING.md` §4 AD-30..AD-35).
+See [`deploy/vps/README.md`](./deploy/vps/README.md) for the VPS deployment steps (the same
+`docker-compose.yml` stack this repo runs locally, on one host, via a small `docker-compose.prod.yml`
+overlay — `PLANNING.md` §4 AD-30..AD-35).

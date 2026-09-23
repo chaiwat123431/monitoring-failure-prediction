@@ -2,6 +2,7 @@ node_modules/
 __pycache__/
 .venv/
 .env
+.env.fly
 *.pyc
 .next/
 data/

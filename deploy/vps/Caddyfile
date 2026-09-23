@@ -1,0 +1,15 @@
+# PLANNING.md Slice 6 AD-34 (VPS revision). Same path-routing shape as the abandoned Fly version
+# (confirmed correct there with `caddy validate` + a real routing test) — the two differences are
+# the site address (a real hostname, since Caddy now manages its own Let's Encrypt certificate
+# instead of sitting behind Fly's edge TLS) and the upstreams (compose service-name DNS —
+# `backend`/`frontend` — instead of Fly's shared-network-namespace `localhost`).
+{$PUBLIC_HOSTNAME} {
+	@backend path /api/* /ws/* /health*
+	handle @backend {
+		reverse_proxy backend:8000
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+}
