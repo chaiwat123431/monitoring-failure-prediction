@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .env
 .env.fly
+.env.prod
 *.pyc
 .next/
 data/

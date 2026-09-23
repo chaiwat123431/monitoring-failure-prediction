@@ -1636,3 +1636,35 @@ method, and worked through the deploy sequence live:
   baking, the `x-backend-env` anchor, etc., all documented above) were genuine, transferable findings —
   most carry over directly to the VPS-based Caddyfile and Dockerfiles unchanged, which is why AD-32
   (Dockerfiles) in particular needed no rework at all for the new host.
+
+**`/code-review high` on PR #7 (the VPS replacement) found real issues before the first real deploy,
+same discipline as every prior slice:**
+
+- **`.env.prod` was never added to `.gitignore`**, only `.env` and the now-obsolete `.env.fly` — a real
+  gap, since `deploy/vps/README.md` names `.env.prod` specifically and it holds a freshly-generated
+  Postgres password. Fixed by adding the literal entry.
+- **The Verify section's `curl -sf https://$PUBLIC_HOSTNAME/...` relied on a shell variable that was
+  only ever written into `.env.prod`, never exported** — copy-pasting the README's own commands in
+  order would have expanded to `https:///health` (empty host) and failed confusingly. Fixed by adding
+  an explicit `set -a; source .env.prod; set +a` step before it's needed.
+- **The prod overlay's `volumes: !override` for `backend` dropped `:ro`**, giving the permanently
+  running, internet-facing API process unnecessary write access to `/app/models` — the only reason it
+  was writable at all was so a `docker compose run --rm backend python scripts/train.py` invocation
+  could write to it, reusing `backend`'s own service definition. Fixed by restoring `:ro` on `backend`
+  and adding a small dedicated `train` one-shot service instead (tagged with a Compose `profile` so it
+  never starts on a plain `up -d`, confirmed with `docker compose config --services`) — least privilege
+  for the always-on service, without losing the ability to retrain on demand.
+- **The `!override` merge tag's version requirement was asserted, not checked, against the actual
+  target server.** Verified for real over SSH against the live Hetzner box (a throwaway two-file
+  compose test): Compose v2.32.4 (bundled with the Docker CE marketplace image) supports it correctly.
+- **Minor — simplification**: `build: { target: prod }` was repeated identically across four services.
+  Extracted to an `x-prod-build` YAML anchor, matching the dev file's own `x-backend-env` convention
+  right next to it. The new `train` service needed its own explicit `context: ./backend` alongside the
+  anchor, since (unlike the four services above) it has no base-file entry to inherit `context` from —
+  caught by actually running `docker compose run --rm train` locally (`open Dockerfile: no such file or
+  directory` before the fix), not assumed to work from the anchor alone.
+
+Re-verified after all of the above: `docker compose config` against the real merged files resolves
+exactly as intended (backend `:ro` restored, `train` excluded from `--services`/`up -d` but runnable
+via `run --rm train`, every prod-target service correctly using the shared anchor); `!override`
+re-confirmed on the real server.
