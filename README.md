@@ -18,6 +18,20 @@ docker compose up --build
   per real minute); default `0` sends rows as fast as Kafka accepts them.
 - `consumer` runs continuously, upserting into TimescaleDB's `raw_metrics` hypertable.
 
+## Train the model
+
+Once `raw_metrics` is populated (the ingestion steps above):
+
+```bash
+cd backend
+uv sync
+DATABASE_URL=postgresql://app:app@localhost:${POSTGRES_PORT:-5432}/monitoring uv run python scripts/train.py
+```
+
+Trains one `IsolationForest` on both series, evaluates against `nab_anomaly_windows`, prints
+precision/recall/F1, and saves `models/isolation_forest.joblib` (gitignored, regenerable). See
+`PLANNING.md` §4 AD-15..AD-19 and §6 for the real measured metrics.
+
 ## Smoke test
 
 ```bash
