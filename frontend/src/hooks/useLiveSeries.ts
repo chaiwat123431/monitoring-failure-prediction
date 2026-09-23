@@ -53,12 +53,46 @@ export function useLiveSeries(seriesId: string): LiveSeriesState {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let ws: WebSocket | null = null;
 
+    // Incoming live messages are buffered here and flushed at most once per animation frame,
+    // rather than cloning+re-sorting the whole `points` map on every single message — at
+    // REPLAY_SPEED=0 the producer can emit thousands of messages/sec (PLANNING.md's own
+    // measurements log), far faster than the UI can or should re-render.
+    let pending: Map<string, ChartPoint> = new Map();
+    let pendingModelLoaded: boolean | null = null;
+    let flushRafId: number | null = null;
+
     function lastKnownTime(): string | null {
       let max: string | null = null;
       for (const t of pointsRef.current.keys()) {
         if (max === null || t > max) max = t;
       }
+      for (const t of pending.keys()) {
+        if (max === null || t > max) max = t;
+      }
       return max;
+    }
+
+    function scheduleFlush() {
+      if (flushRafId !== null) return;
+      flushRafId = requestAnimationFrame(() => {
+        flushRafId = null;
+        if (cancelled || pending.size === 0) return;
+        const toApply = pending;
+        pending = new Map();
+        setPoints((prev) => {
+          const next = new Map(prev);
+          for (const [k, v] of toApply) next.set(k, v);
+          return next;
+        });
+        if (pendingModelLoaded !== null) setModelLoaded(pendingModelLoaded);
+      });
+    }
+
+    function scheduleReconnect() {
+      reconnectTimer = setTimeout(() => {
+        reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+        connect();
+      }, reconnectDelay);
     }
 
     async function connect() {
@@ -82,7 +116,15 @@ export function useLiveSeries(seriesId: string): LiveSeriesState {
           }
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+        // Don't open a socket over data we know may now be incomplete/stale — retry the whole
+        // connect() (history fetch included) with the same backoff as a dropped socket, rather
+        // than falling through to a WebSocket that would silently mask the failed fetch behind
+        // an apparently-healthy "Live" badge.
+        setConnectionState(reconnecting ? "reconnecting" : "connecting");
+        scheduleReconnect();
+        return;
       }
       if (cancelled) return;
 
@@ -99,21 +141,24 @@ export function useLiveSeries(seriesId: string): LiveSeriesState {
       ws.onmessage = (event) => {
         if (cancelled) return;
         const msg: LiveMessage = JSON.parse(event.data);
-        setPoints((prev) => {
-          const next = new Map(prev);
-          next.set(msg.timestamp, { time: msg.timestamp, value: msg.value, is_anomaly: msg.is_anomaly });
-          return next;
-        });
-        setModelLoaded(msg.model_loaded);
+        pending.set(msg.timestamp, { time: msg.timestamp, value: msg.value, is_anomaly: msg.is_anomaly });
+        pendingModelLoaded = msg.model_loaded;
+        scheduleFlush();
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event) => {
         if (cancelled) return;
+        // AD-23: the server closes with 1008 only for an unknown series_id — a value this
+        // dashboard only ever sends from GET /api/series in the first place, but if the backend's
+        // registry ever changes under a live session, retrying that exact request forever would
+        // never succeed. Settle into "closed" instead of retrying indefinitely.
+        if (event.code === 1008) {
+          setConnectionState("closed");
+          setError(event.reason || "server rejected the connection");
+          return;
+        }
         setConnectionState("reconnecting");
-        reconnectTimer = setTimeout(() => {
-          reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-          connect();
-        }, reconnectDelay);
+        scheduleReconnect();
       };
 
       // A socket error is always followed by close (per the WebSocket spec) — onclose alone
@@ -129,6 +174,7 @@ export function useLiveSeries(seriesId: string): LiveSeriesState {
     return () => {
       cancelled = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (flushRafId !== null) cancelAnimationFrame(flushRafId);
       ws?.close();
     };
   }, [seriesId, mergeHistory]);

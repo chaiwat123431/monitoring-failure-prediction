@@ -1,12 +1,9 @@
 "use client";
 
+import { formatDateTime } from "@/lib/format";
 import type { ChartPoint } from "@/lib/types";
 
 const MAX_ALERTS = 50;
-
-function formatTime(iso: string): string {
-  return new Date(iso).toLocaleString();
-}
 
 interface Props {
   points: ChartPoint[];
@@ -39,7 +36,7 @@ export function AlertsPanel({ points, modelLoaded }: Props) {
         <ul className="alert-list">
           {alerts.map((p) => (
             <li key={p.time} className="alert-item">
-              <span className="alert-item-time">{formatTime(p.time)}</span>
+              <span className="alert-item-time">{formatDateTime(p.time)}</span>
               <span className="alert-item-value">value: {p.value.toFixed(2)}</span>
             </li>
           ))}

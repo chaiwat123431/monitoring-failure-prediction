@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { AlertsPanel } from "@/components/AlertsPanel";
 import { ConnectionBadge } from "@/components/ConnectionBadge";
+import { ErrorBanner } from "@/components/ErrorBanner";
 import { MetricChart } from "@/components/MetricChart";
 import { ModelStatusBanner } from "@/components/ModelStatusBanner";
 import { SeriesSelector } from "@/components/SeriesSelector";
@@ -14,10 +15,11 @@ import type { SeriesListItem } from "@/lib/types";
 // call site below) rather than a single long-lived useLiveSeries instance reacting to a changing
 // seriesId — every piece of per-series state starts genuinely fresh, no manual reset logic needed.
 function Dashboard({ seriesId }: { seriesId: string }) {
-  const { points, labeledWindows, modelLoaded, connectionState } = useLiveSeries(seriesId);
+  const { points, labeledWindows, modelLoaded, connectionState, error } = useLiveSeries(seriesId);
 
   return (
     <>
+      <ErrorBanner message={error} />
       <ModelStatusBanner modelLoaded={modelLoaded} />
       <div className="dashboard-body">
         <div className="panel">
@@ -38,14 +40,20 @@ function Dashboard({ seriesId }: { seriesId: string }) {
 export default function Home() {
   const [series, setSeries] = useState<SeriesListItem[]>([]);
   const [selectedSeriesId, setSelectedSeriesId] = useState<string | null>(null);
+  const [seriesError, setSeriesError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    getSeries().then((list) => {
-      if (cancelled) return;
-      setSeries(list);
-      setSelectedSeriesId((current) => current ?? list[0]?.series_id ?? null);
-    });
+    getSeries()
+      .then((list) => {
+        if (cancelled) return;
+        setSeries(list);
+        setSelectedSeriesId((current) => current ?? list[0]?.series_id ?? null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setSeriesError(err instanceof Error ? err.message : String(err));
+      });
     return () => {
       cancelled = true;
     };
@@ -60,6 +68,8 @@ export default function Home() {
 
       {selectedSeriesId ? (
         <Dashboard key={selectedSeriesId} seriesId={selectedSeriesId} />
+      ) : seriesError ? (
+        <ErrorBanner message={`Failed to load the series list: ${seriesError}`} />
       ) : (
         <p className="empty-state">Loading…</p>
       )}

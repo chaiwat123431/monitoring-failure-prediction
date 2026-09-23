@@ -12,6 +12,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import { formatAxisTick, formatDateTime } from "@/lib/format";
 import type { ChartPoint, LabeledWindow } from "@/lib/types";
 
 interface Props {
@@ -54,20 +55,11 @@ function ChartTooltip({ active, payload }: { active?: boolean; payload?: Array<{
   const point = payload[0].payload;
   return (
     <div className="panel" style={{ padding: "8px 12px", fontSize: 12 }}>
-      <div>{new Date(point.time).toLocaleString()}</div>
+      <div>{formatDateTime(point.time)}</div>
       <div>value: {point.value.toFixed(2)}</div>
       <div>{statusLabel(point.is_anomaly)}</div>
     </div>
   );
-}
-
-function formatTick(t: number): string {
-  return new Date(t).toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 }
 
 export function MetricChart({ points, labeledWindows }: Props) {
@@ -98,7 +90,7 @@ export function MetricChart({ points, labeledWindows }: Props) {
             type="number"
             domain={["dataMin", "dataMax"]}
             scale="time"
-            tickFormatter={formatTick}
+            tickFormatter={formatAxisTick}
             stroke="var(--baseline)"
             tick={{ fill: "var(--text-muted)", fontSize: 11 }}
           />

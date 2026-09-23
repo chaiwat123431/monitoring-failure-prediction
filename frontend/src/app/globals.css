@@ -22,8 +22,11 @@
   --window-band-fill: rgba(250, 178, 25, 0.16);
 }
 
+/* Dark mode follows the OS setting only — this slice has no theme-toggle UI, so there is no
+   `data-theme` attribute for a scoped override to ever match; add one only alongside an actual
+   toggle control. */
 @media (prefers-color-scheme: dark) {
-  :root:where(:not([data-theme="light"])) {
+  :root {
     color-scheme: dark;
     --surface: #1a1a19;
     --page: #0d0d0d;
@@ -44,28 +47,6 @@
 
     --window-band-fill: rgba(250, 178, 25, 0.12);
   }
-}
-
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --surface: #1a1a19;
-  --page: #0d0d0d;
-  --text-primary: #ffffff;
-  --text-secondary: #c3c2b7;
-  --text-muted: #898781;
-  --gridline: #2c2c2a;
-  --baseline: #383835;
-  --border: rgba(255, 255, 255, 0.1);
-
-  --series-line: #3987e5;
-  --series-line-muted: #184f95;
-
-  --status-good: #0ca30c;
-  --status-warning: #fab219;
-  --status-serious: #ec835a;
-  --status-critical: #e66767;
-
-  --window-band-fill: rgba(250, 178, 25, 0.12);
 }
 
 * {
@@ -174,6 +155,11 @@ select {
   background: color-mix(in srgb, var(--status-warning) 14%, var(--surface));
   color: var(--text-primary);
   font-size: 14px;
+}
+
+.banner-critical {
+  border-color: var(--status-critical);
+  background: color-mix(in srgb, var(--status-critical) 14%, var(--surface));
 }
 
 .banner-icon {

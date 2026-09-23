@@ -1300,3 +1300,56 @@ Added `backend/tests/unit/test_feed_consumer.py` (previously nonexistent) coveri
 `series_id` skip and the outer loop's retry-after-failure behavior. Re-ran the full empirical bar
 once more after all of the above, on a stack rebuilt from these fixes: 1,518/1,518 live messages
 matched `model.predict()` independently — 0 mismatches. 55/55 backend tests pass.
+
+### Slice 5 — Frontend
+
+No CI is configured for this project (verification has always run against the real `docker compose`
+stack, not a pipeline) — `/code-review high` was run manually against PR #5 before merging, matching
+the bar every prior slice's PR was held to:
+
+- **A failed initial `GET /history` silently opened the WebSocket anyway.** `connect()` caught the
+  fetch error, set `error`, and fell through unconditionally into `ws = new WebSocket(...)` — if
+  that socket then connected, `connectionState` became `"open"` ("Live") while `points` stayed
+  empty forever, since a later reconnect's gap-fill also had nothing to work from
+  (`lastKnownTime()` returns `null` with zero points ever recorded). A backend blip at the exact
+  moment a series is selected would have shown a healthy-looking, permanently blank chart. Fixed:
+  a fetch failure (initial or reconnect gap-fill) now retries the *whole* `connect()` — history
+  fetch included — on the same backoff as a dropped socket, and never opens a socket over data
+  known to be incomplete.
+- **`ws.onclose` never inspected the close code**, so a permanent rejection (AD-23: code `1008` for
+  an unknown `series_id`) would have been retried with exponential backoff forever instead of
+  settling into the `"closed"` state `ConnectionState` already declared but nothing ever set. Fixed:
+  a `1008` close now sets `connectionState: "closed"` and surfaces the close reason as an error,
+  without scheduling another attempt.
+- **`useLiveSeries`'s `error` field was computed but never rendered anywhere** — every fetch/socket
+  failure above was already tracked in state and completely invisible to the user. Added
+  `components/ErrorBanner.tsx` (rendered in `page.tsx`'s `Dashboard`, plus for a failed
+  `GET /api/series` at the top level) so a connection problem is always visible, not just logged to
+  state no component reads.
+- **`getSeries().then(...)` had no `.catch()`** in `page.tsx` — a failed `/api/series` call was an
+  unhandled promise rejection and left the page on "Loading…" forever with zero indication anything
+  was wrong. Fixed with a `.catch()` setting a `seriesError` state, rendered via the same
+  `ErrorBanner`. Reproduced directly: stopped `backend`, loaded the page fresh, confirmed the banner
+  ("Connection problem: Failed to load the series list: Failed to fetch") replaces the old
+  infinite-spinner behavior; restarted `backend` and confirmed a fresh load recovers normally.
+- **Every incoming live WebSocket message cloned the entire `points` `Map` and re-sorted it** — fine
+  at the message rates a real demo replay produces, but at `REPLAY_SPEED=0` (the project's own
+  "as fast as Kafka accepts" mode, PLANNING's Slice 2 measurements log) messages arrive far faster
+  than a browser tab should re-render. Fixed by buffering incoming messages in a plain object
+  (not React state) and flushing at most once per animation frame via `requestAnimationFrame`,
+  bounding the clone+sort cost to the browser's own paint rate regardless of message arrival rate —
+  the same "don't do avoidable work per message" instinct as the backend's own AD-21
+  `asyncio.to_thread` fix, applied on the client side instead.
+- **Minor — date/time formatting was duplicated** across `AlertsPanel` and `MetricChart`'s tooltip
+  and axis-tick formatter. Extracted to `lib/format.ts` (`formatDateTime`, `formatAxisTick`) so a
+  future display-format change (e.g. forcing UTC display, given this same review's own empirical
+  verification note about local-timezone tooltip confusion) has one place to change, not three.
+- **Minor — dead CSS**: `globals.css` declared a `:root[data-theme="dark"]` override block, but no
+  component in this slice ever sets a `data-theme` attribute — no toggle UI exists yet, so the rule
+  could never match. Removed rather than left as an apparent (but non-functional) theme-toggle hook;
+  dark mode is OS-`prefers-color-scheme`-only until an actual toggle is built.
+
+All fixes re-verified against the real running stack via a live Chrome session (not just `tsc`/lint/
+build, though all three stayed clean): the fetch-failure retry and the new error banner were both
+reproduced by stopping `backend` mid-session and on a fresh page load, confirming the fix in each
+case before restarting `backend` and confirming recovery. Squash-merged to `main` after this pass.
